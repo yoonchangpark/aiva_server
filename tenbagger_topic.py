@@ -1,7 +1,12 @@
-"""
-텐배거 헌터 연동 모듈
-/api/screener에서 TENBAGGER/COMPOUNDER 등급 종목을 가져와
+﻿"""
+텐배거 헌터 연동 모듈 — "미래 텐배거 추천" 모드
+/api/v2/shorts-feed?mode=candidate 에서 탑다운 발굴 후보를 가져와
 쇼츠 파이프라인의 (주제, 문맥 데이터) 형식으로 변환한다.
+
+⚠️ 2026-07 변경: 예전엔 /api/screener?grade=TENBAGGER,COMPOUNDER (구 스코어링)를 썼으나,
+포스트모템(scoring_postmortem.md)에서 그 등급이 실제 텐배거와 역상관임이 확인됐다.
+그래서 이제는 tenbagger의 shorts-feed(mode=candidate) — 거시→산업→해자 탑다운 발굴 +
+DART 재무로 검증한 소수 정예 후보 — 를 그대로 쓴다.
 
 환경변수:
   TENBAGGER_API_BASE — 텐배거 API 주소 (기본: http://localhost:8000)
@@ -27,46 +32,30 @@ def _fmt(v, suffix="", digits=1):
 
 
 def _build_context(c: dict) -> str:
-    """스코어 row → GPT 대본용 팩트 문자열"""
+    """shorts-feed candidate 항목 → GPT 대본용 팩트 문자열"""
     lines = [
-        f"종목명: {c['name']} ({c['ticker']}, {c.get('market', '')})",
-        f"텐배거 등급: {c.get('grade')} | 종합점수 {_fmt(c.get('total_score'))}/10 | 성장성 {_fmt(c.get('growth_score'))}/10",
-        f"5년 매출 CAGR: {_fmt(c.get('revenue_cagr_5y'), '%')}",
-        f"5년 EPS CAGR: {_fmt(c.get('eps_cagr_5y'), '%')}",
-        f"5년 평균 ROE: {_fmt(c.get('avg_roe_5y'), '%')}",
-        f"평균 FCF 마진: {_fmt(c.get('avg_fcf_margin'), '%')}",
-        f"부채비율: {_fmt(c.get('debt_ratio'), '%')}",
-        f"배당수익률: {_fmt(c.get('dividend_yield'), '%')}",
-        f"PER: {_fmt(c.get('per'))} | PBR: {_fmt(c.get('pbr'))}",
-        f"업종: {c.get('sector', '')} {c.get('growth_tag', '')}".strip(),
+        f"종목명: {c['name']} ({c['ticker']})",
+        f"업종: {c.get('sector', '')}",
+        f"발굴 논리(거시→산업→해자): {c.get('narrative', '')}",
+        f"테마 유형: {c.get('thesis_type', '')}",
     ]
+    for f in c.get("facts", []):
+        period = f.get("period", "")
+        lines.append(f"{f.get('label')}: {f.get('value')}" + (f" ({period})" if period else ""))
+    if c.get("target_scenario"):
+        lines.append(f"향후 시나리오: {c['target_scenario']}")
+    if not c.get("dart_verified"):
+        lines.append("※ 재무 배수 DART 대조 미검증 — 화면 숫자로 쓰지 말 것")
     return "\n".join(lines)
 
 
 def _card_metrics(c: dict) -> list:
-    """스코어 row → 카드용 (라벨, 값, 미니바비율) 리스트. 값 있는 항목만."""
-    rows = []
-
-    def add(label, v, suffix="%", denom=None):
-        if v is None:
-            return
-        try:
-            fv = float(v)
-        except (TypeError, ValueError):
-            return
-        ratio = max(0.0, min(1.0, fv / denom)) if denom else None
-        rows.append((label, f"{fv:,.1f}{suffix}", ratio))
-
-    add("5년 매출 성장률(CAGR)", c.get("revenue_cagr_5y"), denom=50)
-    add("5년 EPS 성장률(CAGR)", c.get("eps_cagr_5y"), denom=50)
-    add("5년 평균 ROE", c.get("avg_roe_5y"), denom=30)
-    add("평균 FCF 마진", c.get("avg_fcf_margin"), denom=30)
-    add("부채비율", c.get("debt_ratio"), denom=None)
-    return rows
+    """shorts-feed facts[] → 카드용 (라벨, 값, None) 리스트. facts는 이미 포맷된 문자열이라 미니바 비율은 없음."""
+    return [(f.get("label"), f.get("value"), None) for f in c.get("facts", []) if f.get("label")]
 
 
 async def _fetch_qualitative(base: str, ticker: str) -> str:
-    """AI 정성 분석 (사업모델·해자) — 실패해도 파이프라인은 계속 (빈 문자열 반환)"""
+    """AI 정성 분석 (사업모델·해자) — 실패해도 파이프라인은 계속 (빈 문자열 반환). shorts-feed의 narrative를 보강하는 용도."""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -82,38 +71,44 @@ async def _fetch_qualitative(base: str, ticker: str) -> str:
             parts.append(f"경쟁우위(해자) 점수: {q['moat_score']}/10 — {moat.get('summary', '')}")
         return "\n".join(parts)
     except Exception as e:
-        logger.warning(f"정성 분석 조회 실패 (수치만으로 진행): {e}")
+        logger.warning(f"정성 분석 조회 실패 (shorts-feed 데이터만으로 진행): {e}")
         return ""
+
+
+async def _fetch_candidates(base: str, limit: int = 20) -> list[dict]:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{base}/api/v2/shorts-feed",
+            params={"mode": "candidate", "limit": limit},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        return resp.json().get("items", [])
 
 
 async def pick_tenbagger_topic(exclude_topics: list[str] | None = None,
                                clip_dir: str = ".",
                                render_clips: bool = True) -> tuple[str, str, dict]:
     """
-    상위 등급 종목 중 히스토리에 없는 첫 종목을 골라 (주제, 문맥, asset_clips) 반환.
+    shorts-feed(mode=candidate) 목록 중 히스토리에 없는 첫 종목을 골라 (주제, 문맥, asset_clips) 반환.
     asset_clips: {'card': mp4경로} — 영상의 source_type=='card' 씬에 삽입됨.
     render_clips=False 면 카드 mp4 렌더를 건너뛴다(대본 프리뷰용 — 빠름).
     실패 시 ValueError — 호출 측에서 기존 트렌드 모드로 폴백할 것.
     """
     exclude = exclude_topics or []
     base = os.getenv("TENBAGGER_API_BASE", "http://localhost:8000").rstrip("/")
-    url = f"{base}/api/screener"
-    params = {"grade": "TENBAGGER,COMPOUNDER", "sort": "total_score", "limit": 20}
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, params=params, timeout=20.0)
-        resp.raise_for_status()
-        companies = resp.json().get("companies", [])
+    candidates = await _fetch_candidates(base)
+    if not candidates:
+        raise ValueError("텐배거 후보 없음 — tenbagger의 shorts-feed(mode=candidate) 목록이 비어 있음")
 
-    if not companies:
-        raise ValueError("텐배거 추천 종목 없음 (ETL 미실행?)")
-
-    for c in companies:
-        topic = f"{c['name']} 주가 10배 가능성 분석"
+    for c in candidates:
         if any(c["name"] in t for t in exclude):
             continue
+        topic = f"{c['name']}, 지금 텐배거 후보로 보이는 이유"
+
         qualitative = await _fetch_qualitative(base, c["ticker"])
-        narrative_block = f"\n[왜 이 종목인가 — AI 정성 분석]\n{qualitative}\n" if qualitative else ""
+        narrative_block = f"\n[AI 정성 분석 — 보강]\n{qualitative}\n" if qualitative else ""
 
         # 텐배거 분석 카드 클립 생성 (영상 source_type=='card' 씬에 삽입)
         asset_clips = {}
@@ -123,8 +118,7 @@ async def pick_tenbagger_topic(exclude_topics: list[str] | None = None,
             card_data = {
                 "name": c["name"],
                 "ticker": c["ticker"],
-                "grade": c.get("grade"),
-                "total_score": c.get("total_score"),
+                "subtitle": c.get("sector", ""),
                 "metrics": _card_metrics(c),
             }
             if make_score_card(card_data, card_path):
@@ -132,27 +126,31 @@ async def pick_tenbagger_topic(exclude_topics: list[str] | None = None,
 
         card_rule = (
             "3-1. Scene 2 또는 3 중 하나는 반드시 source_type을 'card'로 지정하라 "
-            "(텐배거 시스템의 분석 카드 — 등급·종합점수·핵심지표가 화면에 뜬다). "
-            "해당 narration은 '재무 데이터로 분석한 결과' 맥락으로, 카드를 가리키듯 말하라 "
+            "(DART 재무로 검증한 해자 지표 카드가 화면에 뜬다). "
+            "해당 narration은 '재무 데이터로 검증한 결과' 맥락으로, 카드를 가리키듯 말하라 "
             "(예: \"숫자로만 보면 이렇습니다\").\n"
             if asset_clips.get("card") else ""
         )
         context = (
             f"{_build_context(c)}\n{narrative_block}\n"
-            f"[대본 작성 가이드 — 스토리텔링 우선, 수치는 근거로]\n"
-            f"1. 훅(첫 Scene): {c['name']}을(를) 한 문장으로 각인시켜라. 가장 강력한 수치 1개를 충격적 사실처럼 던져라 "
-            f"(예: \"{c['name']}, 5년 새 매출이 폭발한 회사입니다\"). 단조로운 \"시스템 점수 X점\" 나열로 시작하지 마라.\n"
-            f"2. 수치는 '서사의 근거'다. 전체 대본에서 가장 강력한 수치 2~3개만 골라 깊게 꽂아라. "
-            f"모든 문장에 숫자를 욱여넣지 마라 — 숫자 없는 Scene이 있어도 좋다. 그 자리는 '왜 지금인가', '시장이 놓친 것', "
-            f"'경쟁자가 못 따라오는 이유' 같은 서사적 긴장과 맥락으로 채워라.\n"
-            f"3. 사업모델·경제적 해자(위 정성 분석)를 이야기의 중심에 둬라. '무엇을 파는 회사이고 왜 강한가'를 "
-            f"수치 나열이 아니라 스토리로 풀어라. '전문가들', '월가가 주목' 같은 근거 없는 공허한 멘트만 금지한다.\n"
+            f"[대본 작성 가이드 — 탑다운 발굴 구조: 거시 → 산업 독점 → 실적 폭발(숫자)]\n"
+            f"1. 훅(첫 Scene): {c['name']}을(를) 한 문장으로 각인시켜라. "
+            f"'{c.get('narrative', '')}' 라는 발굴 논리를 임팩트 있게 던져라. "
+            f"단조로운 수치 나열로 시작하지 마라.\n"
+            f"2. 거시 흐름 → 그 산업이 필연적으로 커질 수밖에 없는 이유 → 이 회사가 그 산업에서 "
+            f"독점/과점적 위치인 이유 순서로 논리를 쌓아라 (거시→산업→해자 구조).\n"
+            f"3. 위 facts(DART 실공시)만 화면 숫자로 인용하라. 근거 없는 목표주가·확정적 전망은 "
+            f"절대 말하지 마라 — 이건 확정된 과거가 아니라 '지금 시점의 시나리오'다.\n"
             f"{card_rule}"
-            f"4. 전체 분량 60~75초. 빠른 리듬으로 끝까지 끌고 가라.\n"
-            f"5. 마지막 Scene은 source_type을 반드시 'disclaimer'로 지정하고 narration에 다음 문구를 넣어라: \"{DISCLAIMER}\" "
+            f"4. ★필수: 이 종목은 아직 결과가 나오지 않은 미래 시나리오다. "
+            f"'무조건 오른다', '텐배거 확정' 같은 단정적 표현을 절대 쓰지 마라. "
+            f"'~할 가능성', '~라는 시나리오가 있다', '지켜볼 지점' 같은 절제된 표현을 써라.\n"
+            f"5. 전체 분량 60~75초. 빠른 리듬으로 끝까지 끌고 가라.\n"
+            f"6. 마지막 Scene은 source_type을 반드시 'disclaimer'로 지정하고 narration에 다음 문구를 넣어라: "
+            f"\"{c.get('risk_note', DISCLAIMER)} {DISCLAIMER}\" "
             "(이 씬은 TTS 낭독 없이 영상 하단 자막으로만 표시된다.)"
         )
-        logger.info(f"텐배거 주제 선정: {topic} (점수 {c.get('total_score')})")
+        logger.info(f"텐배거 후보 주제 선정: {topic} (테마: {c.get('thesis_type')})")
         return (topic, context, asset_clips)
 
-    raise ValueError("미사용 텐배거 종목 없음 — 전부 히스토리에 존재")
+    raise ValueError("미사용 텐배거 후보 없음 — shorts-feed candidate 리스트 소진, tenbagger 쪽에 신규 후보 추가 필요")

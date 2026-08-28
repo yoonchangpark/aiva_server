@@ -27,6 +27,46 @@ logger = logging.getLogger(__name__)
 
 HISTORY_LIST_FILE = os.path.join("data", "tenbagger_history.json")
 
+# ── 회고편 서사 지침 (context 최상단에 강제 삽입) ────────────────
+NARRATIVE_DIRECTIVE = """
+[★★★ 이 영상의 서사 설계 — 아래 5단 구조를 반드시 따라라 ★★★]
+목표: 시청자가 "아, 그때 이 흐름을 봤다면 나도 살 수 있었겠다"고 무릎을 치게 만든다.
+숫자 나열만으로는 절대 그 감정이 안 나온다. 왜 그런 숫자가 나왔는지를 먼저 설명해야
+숫자가 증거가 된다. 설명 없는 숫자는 결과론으로 읽힌다.
+
+[1단계 — 훅 (Scene 1~3)] 당시의 무관심 vs 이후 결과를 충격적으로 대비시켜라.
+
+[2단계 — 수요는 왜 폭증했나 (Scene 4~9)] ★★가장 중요, 절대 생략 금지★★
+  이 회사의 제품/서비스를 사겠다는 사람이 왜 갑자기 몰렸는지를 이야기로 풀어라.
+  반드시 포함할 것:
+   (a) 촉발 사건 — 흐름을 폭발시킨 구체적 사건을 연도와 함께 명시
+       (예: "2022년 우크라이나 전쟁", "2023년 챗GPT 등장으로 시작된 AI 데이터센터 경쟁")
+   (b) 그 사건이 만든 수요 — 누가, 왜, 얼마나 급하게 원하게 됐는지
+       (예: "유럽이 70년 만에 재무장을 선언하며 국방비를 쏟아붓기 시작했다")
+  ❌ 나쁜 예: "지정학적 긴장이 고조되었습니다" (누가 무엇을 왜 원하는지 없음)
+  ✅ 좋은 예: "독일이 70년 만에 재무장을 선언했고, 폴란드는 당장 무기가 필요했다"
+
+[3단계 — 공급은 왜 못 따라갔나 = 이 회사의 해자 (Scene 10~13)] ★절대 생략 금지★
+  수요가 늘어도 아무나 팔 수 있으면 돈을 못 번다. 왜 하필 이 회사였는지를 설명하라.
+  경쟁자가 왜 못 채웠는지 → 이 회사만 가진 것(생산 캐파·납기·기술·점유율)을 대비시켜라.
+  (예: "서방 방산은 수십 년간 감축돼 생산라인도 납기도 안 나왔다. 그 공백을
+   이미 양산 체제를 갖춘 K9이 채웠고, 폴란드와 대규모 계약으로 이어졌다")
+
+[4단계 — 그래서 실적이 이렇게 찍혔다 (Scene 14~17)] ★숫자는 최대 4개 Scene★
+  문맥 데이터의 매출·영업이익 실수치를 3개 이상 정확히 인용하라. 단, 연도별로
+  모두 나열하지 마라 — 시작·정점(·전환점)만 뽑아 계단식으로 배치한다.
+  숫자를 늘려서 2·3단계를 밀어내면 명백한 실패다.
+
+[5단계 — 공감·교훈 + CTA (Scene 18~22)] "재무제표만 봤다면 안 보였다. 하지만
+  산업의 흐름과 숫자를 함께 봤다면 보였다"를 시청자 감정에 꽂아라. 사이클·광풍
+  사례라면 정점 이후 둔화/적자도 반드시 정직하게 다뤄라.
+  CTA는 마지막에서 두 번째, 마지막 Scene은 반드시 source_type "disclaimer"로
+  면책 문구를 넣어라. CTA 뒤에 본문 내용이 다시 오면 시청자가 이탈한다.
+
+[분량] 최소 22개 Scene. 다 쓴 뒤 개수를 직접 세고, 모자라면 2단계와 3단계를
+더 잘게 쪼개서 채워라 — 이 두 구간이 영상의 심장이다(숫자를 늘리지 마라).
+"""
+
 # ── 사례 유형별 서사 프레임 ──────────────────────────────────
 # 모든 사례는 공통 백본("대중은 늦는다, 숫자는 먼저 온다")을 쓰되,
 # 결말 교훈과 카드 프레이밍은 종목 성격에 맞춰 분기한다.
@@ -232,7 +272,8 @@ async def _fetch_qualitative(base: str, ticker: str) -> str:
 
 async def pick_history_topic(exclude_topics: list[str] | None = None,
                              chart_dir: str = ".",
-                             render_clips: bool = True) -> tuple[str, str, dict]:
+                             render_clips: bool = True,
+                             preferred: str = "") -> tuple[str, str, dict]:
     """
     큐레이션 목록에서 히스토리에 없는 종목을 골라 (주제, 문맥, asset_clips) 반환.
     asset_clips: {'chart': 검색량차트mp4, 'card': 분석카드mp4} — 생성된 것만 포함.
@@ -244,10 +285,22 @@ async def pick_history_topic(exclude_topics: list[str] | None = None,
     curated = _load_curated_list()
 
     target = None
-    for item in curated:
-        if not any(item["name"] in t for t in exclude):
-            target = item
-            break
+    # 사용자가 종목을 지정했으면 그 종목을 우선 선택한다(이미 만든 적 있어도 존중).
+    if preferred:
+        key = preferred.strip().replace(" ", "")
+        for item in curated:
+            name_key = item["name"].replace(" ", "")
+            if key in name_key or name_key in key or key == item.get("ticker"):
+                target = item
+                logger.info(f"지정 종목 선택: {item['name']} (입력='{preferred}')")
+                break
+        if target is None:
+            logger.warning(f"지정 종목 '{preferred}'을(를) 큐레이션 목록에서 못 찾음 — 자동 선택으로 대체")
+    if target is None:
+        for item in curated:
+            if not any(item["name"] in t for t in exclude):
+                target = item
+                break
     if target is None:
         raise ValueError("미사용 과거 텐배거 종목 없음 — data/tenbagger_history.json에 추가 필요")
 
@@ -313,6 +366,7 @@ async def pick_history_topic(exclude_topics: list[str] | None = None,
     topic = f"{base_year}년의 {name}, {topic_suffix}"
     # 데이터 라벨에 '시스템 점수' 같은 내부 용어를 쓰지 않는다(GPT가 그대로 베껴 읽는 것 방지)
     lines = [
+        NARRATIVE_DIRECTIVE,
         f"종목명: {name} ({ticker})",
         f"[{base_year}년 당시 재무데이터만으로 분석한 결과]",
         f"재무 종합 평가: 10점 만점에 {_fmt(score.get('total_score'))}점 | 당시 분류 등급: {score.get('grade', 'N/A')}",

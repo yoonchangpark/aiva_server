@@ -1,3 +1,7 @@
+import PIL.Image
+if not hasattr(PIL.Image, 'ANTIALIAS'):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS  # Pillow 10+ 하위호환 (moviepy 1.0.3용)
+
 import os
 import json
 import logging
@@ -64,12 +68,14 @@ app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 class ShortsRequest(BaseModel):
     topic: str = "2026 글로벌 비즈니스 인사이트"
     target_audience: str = "investors"
+    preferred: str = ""   # 모드 내에서 특정 종목 지정(빈 값이면 자동 선택)
     style: str = "brand_story"
 
 
 class FromScriptRequest(BaseModel):
     """'대본만 보기'로 검증한 대본을 GPT 재생성 없이 그대로 영상화."""
     topic: str = "history"          # card/chart 에셋 생성을 위해 모드 유지
+    preferred: str = ""             # 대본과 같은 종목으로 에셋을 만들기 위해 필수
     top_title: str = ""
     scenes: list = []
 
@@ -122,6 +128,12 @@ async def call_openai_script(topic: str, context: str):
     "{selected_hook}"
     (반드시 추출한 기업명과 내용에 맞는 구체적 수치를 자연스럽게 채워넣을 것. 영상 시작 0~3초 안에 시청자의 시선을 완벽히 앗아가라.)
     2. 구체적인 명분(근거) 제시: "기술력이 좋습니다"라고 퉁치지 마. "국경 간 송금 시간 3초" 등 명확한 근거 데이터를 하나 이상 꽂아 넣을 것. 제공된 [🔥 NotebookLM 심층 분석 인사이트]의 핵심 데이터나 전문가 시각을 반드시 1개 이상 대본에 인용해라.
+    3. [💰 팩트 그라운딩 절대 규칙 — 환각 금지] 아래 "문맥 데이터"에 실제 재무 수치(매출·영업이익·
+    성장배수·수익률 등 구체적 숫자)가 주어지면, 그 숫자를 최소 2개 이상 정확히 그대로(자연스러운
+    반올림 표현은 허용, 새 숫자 창작은 금지) narration에 인용해라. 문맥 데이터에 없는 숫자·사례·계약을
+    지어내지 마라. 문맥 데이터가 비어있지 않은 이상, "혁신적 기술로", "성장 가능성을 높게 평가한다"
+    같이 숫자 없는 막연한 문장으로 Scene을 채우면 실패로 간주한다. 훅(Hook)도 문맥 데이터 안에서
+    가장 충격적인 숫자 하나로 시작해라.
     [🔥 B-roll 검색어(Search) 생성 절대 규칙: '시각 연출 감독' 모드 🔥]
     1. [가장 중요] B-roll 검색어(`search` 필드)는 반드시 "영상 검색을 위한 구체적인 영어 키워드"로만 작성해라. (한글 절대 금지)
     2. 절대로 추상적 개념(Business, Economy, Investment, Future, Success 등)을 쓰지 마라. 이런 단어를 쓰면 엉뚱한 영상이 매칭된다.
@@ -476,107 +488,108 @@ async def inject_source_to_notebooklm(youtube_url: str) -> bool:
 
 
 async def step_3_audio_and_edit(script_data: list, force_free_tts: bool = False, output_dir: str = None):
-    """(비동기) ElevenLabs TTS 사용, 에러 시 gTTS 우회. 나레이션 텍스트만 추출하여 읽습니다."""
-    
+    """(비동기) ElevenLabs TTS 사용, 에러 시 gTTS 우회. Scene별로 개별 생성해 실제 길이를 측정합니다."""
+
     import re
-    # "10.0" → "10" : 소수점 .0 제거 (TTS가 "십분의영"처럼 읽는 것 방지, 자막도 동일 적용)
+    from pydub import AudioSegment
+    from pydub.silence import split_on_silence
+
+    # "10.0" → "10" 소수점 제거 + 괄호 내용 제거는 Scene 단위로 적용
     narration_parts = [
-        re.sub(r'(\d+)\.0(?!\d)', r'\1', scene['narration'])
+        re.sub(r'(\d+)\.0(?!\d)', r'\1', re.sub(r'\(.*?\)', '', scene['narration']))
         for scene in script_data
         if 'narration' in scene and scene.get('source_type') != 'disclaimer'
     ]
-    full_narration_text = " ".join(narration_parts)
-    # Task 3: TTS 텍스트 정제 (괄호 및 내용 제거)
-    full_narration_text = re.sub(r'\(.*?\)', '', full_narration_text)
-    
+
     timestamp = int(time.time())
-    file_name = f"voice_{timestamp}.mp3"
     save_dir = output_dir if output_dir else ASSETS_DIR
-    audio_path = os.path.join(save_dir, file_name)
-    
-    # ElevenLabs API 설정 (Task 3)
-    # 보이스 변경: .env에 ELEVENLABS_VOICE_ID 설정 (기본값은 기존 Taehyung 보이스)
+    audio_path = os.path.join(save_dir, f"voice_{timestamp}.mp3")
+
+    # ElevenLabs API 설정 (기존과 동일)
     voice_id = os.getenv("ELEVENLABS_VOICE_ID", "m3gJBS8OofDJfycyA2Ip")
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    
     headers = {
         "Accept": "audio/mpeg",
         "Content-Type": "application/json",
         "xi-api-key": ELEVENLABS_API_KEY
     }
-    
-    payload = {
-        "text": full_narration_text[:4000],
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {
-            "stability": 0.3,
-            "similarity_boost": 0.85,
-            "style": 0.8,
-            "use_speaker_boost": True
-        }
-    }
-    
-    async with httpx.AsyncClient() as client:
-        try:
-            if not ELEVENLABS_API_KEY or force_free_tts:
-                raise ValueError("ElevenLabs API Key is missing or Draft mode forced gTTS.")
-                
-            response = await client.post(url, json=payload, headers=headers, timeout=60.0)
-            response.raise_for_status() 
-            
-            async with aiofiles.open(audio_path, "wb") as f:
-                await f.write(response.content)
-                
-        except Exception as e:
-            logger.warning(f"ElevenLabs TTS 에러 발생({e}). 구글 무료 TTS(gTTS)로 우회합니다.")
+
+    async def synth_scene(client, idx, text, semaphore):
+        """Scene 하나를 개별 TTS로 합성. 실패 시 gTTS로 개별 우회."""
+        scene_path = os.path.join(save_dir, f"voice_{timestamp}_{idx}.mp3")
+        async with semaphore:
             try:
+                if not ELEVENLABS_API_KEY or force_free_tts:
+                    raise ValueError("ElevenLabs API Key is missing or Draft mode forced gTTS.")
+                payload = {
+                    "text": text,
+                    "model_id": "eleven_multilingual_v2",
+                    "voice_settings": {
+                        "stability": 0.3,
+                        "similarity_boost": 0.85,
+                        "style": 0.8,
+                        "use_speaker_boost": True
+                    }
+                }
+                response = await client.post(url, json=payload, headers=headers, timeout=60.0)
+                response.raise_for_status()
+                async with aiofiles.open(scene_path, "wb") as f:
+                    await f.write(response.content)
+            except Exception as e:
+                logger.warning(f"[Scene {idx+1}] ElevenLabs TTS 에러({e}). gTTS로 우회합니다.")
                 def run_gtts():
                     from gtts import gTTS
-                    tts = gTTS(text=full_narration_text, lang='ko')
-                    tts.save(audio_path)
+                    gTTS(text=text, lang='ko').save(scene_path)
                 await asyncio.to_thread(run_gtts)
-            except Exception as fallback_e:
-                logger.error(f"gTTS 백업 실패: {fallback_e}")
-                return None, narration_parts
+        return scene_path
 
-    # Task: 오디오 텐션 최적화 로직 (pydub 무음 제거 및 배속)
-    try:
-        def optimize_audio(path):
-            from pydub import AudioSegment
-            from pydub.silence import split_on_silence
-            
-            audio = AudioSegment.from_mp3(path)
-            
-            # 1. 문장 사이 0.2초(200ms) 이상, -45dB 이하 빈 공간 스킵 & 타이트하게 연결
-            chunks = split_on_silence(
-                audio, 
-                min_silence_len=200, 
-                silence_thresh=-45,
-                keep_silence=50
-            )
+    semaphore = asyncio.Semaphore(4)  # ElevenLabs 동시 호출 제한(레이트리밋 방지)
+    async with httpx.AsyncClient() as client:
+        scene_paths = await asyncio.gather(
+            *[synth_scene(client, i, text, semaphore) for i, text in enumerate(narration_parts)]
+        )
+
+    def optimize_and_concat():
+        """Scene별로 무음 제거 + 배속 적용 후 이어붙이고, 실제 길이를 반환한다."""
+        speed_factor = float(os.getenv("AIVA_SPEED_FACTOR", "1.15"))
+        gap = AudioSegment.silent(duration=120)  # Scene 사이 자연스러운 호흡
+        durations = []
+        combined = None
+
+        for scene_path in scene_paths:
+            audio = AudioSegment.from_mp3(scene_path)
+
+            chunks = split_on_silence(audio, min_silence_len=200, silence_thresh=-45, keep_silence=50)
             if chunks:
                 audio = sum(chunks)
-                
-            # 2. 배속 텐션 업그레이드 (프레임 레이트 조절 트릭, 쇼츠 특유의 통통 튀는 피치)
-            # 한국 경제채널 평균 ~5.5음절/초. gTTS 1.1배속은 ~4.7음절/초로 다소 느림 → 기본 1.15로 상향.
-            # .env의 AIVA_SPEED_FACTOR로 조절 가능 (피치가 높으면 1.1, 더 빠르게는 1.2)
-            speed_factor = float(os.getenv("AIVA_SPEED_FACTOR", "1.15"))
+
             new_sample_rate = int(audio.frame_rate * speed_factor)
             fast_audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_sample_rate})
             fast_audio = fast_audio.set_frame_rate(44100)
-            
-            fast_audio.export(path, format="mp3")
-            
-        await asyncio.to_thread(optimize_audio, audio_path)
-        logger.info("오디오 초미세 무음 구간 커팅 및 1.1배속 텐션 업그레이드 완료")
-    except ImportError:
-        logger.warning("pydub 모듈이 설치되어 있지 않아 오디오 최적화를 스킵합니다. 'pip install pydub'를 실행해 주세요.")
+
+            gap_sec = 0.0 if combined is None else len(gap) / 1000.0
+            combined = fast_audio if combined is None else combined + gap + fast_audio
+            durations.append(len(fast_audio) / 1000.0 + gap_sec)
+
+            try:
+                os.remove(scene_path)
+            except OSError:
+                pass
+
+        combined.export(audio_path, format="mp3")
+        return durations
+
+    try:
+        scene_durations = await asyncio.to_thread(optimize_and_concat)
+        logger.info(f"오디오 Scene {len(scene_durations)}개 개별 생성·배속 적용 및 실제 길이 측정 완료")
     except Exception as e:
-        logger.warning(f"오디오 최적화 실패 (원본 오디오 유지): {e}")
+        logger.error(f"오디오 처리 실패: {e}")
+        return None, narration_parts, []
 
-    return audio_path, narration_parts
+    return audio_path, narration_parts, scene_durations
 
-async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: list, topic: str, is_draft_mode: bool = False, output_dir: str = None, disclaimer_text: str = ""):
+
+async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: list, topic: str, scene_durations: list, is_draft_mode: bool = False, output_dir: str = None, disclaimer_text: str = ""):
     """(비동기) moviepy를 사용하여 비디오와 오디오를 합성하고, 대략적인 자막을 씌웁니다."""
     def _moviepy_assemble():
         from moviepy.editor import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip
@@ -642,7 +655,7 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
                 
                 # [최소 클립 길이 보장] 나레이션당 원래 할당 시간(초) 계산
                 MIN_CLIP_DURATION = 3.0  # 최소 3초: 이보다 짧으면 인접 씬과 합쳐서 같은 소스 클립 위에서 자막만 교체
-                raw_durations = [(len(n) / total_chars) * target_duration for n in narrations]
+                raw_durations = list(scene_durations)  # 글자수 추정 대신 실측 Scene 길이 사용
                 
                 # 인접한 짧은 나레이션들을 하나의 '비주얼 그룹'으로 묶기
                 visual_groups = []  # [(source_clip_idx, total_duration, [scene_indices])]
@@ -776,7 +789,8 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
             
         # 메인 훅(Hook)을 최상단 배너 영역으로 끌어올림
         title_np = create_title_image(topic, width=1080, height=500)
-        title_clip = ImageClip(title_np).set_duration(target_duration)
+        title_intro_duration = min(4.5, target_duration)
+        title_clip = ImageClip(title_np).set_duration(title_intro_duration).fadeout(0.4)
         title_clip = title_clip.set_position(('center', 80)) # Y=80 최상단 밀착
         overlays.append(title_clip)
 
@@ -990,7 +1004,7 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
     return await asyncio.to_thread(_moviepy_assemble)
 
 async def resolve_topic_context(topic: str, chart_dir: str = None,
-                                render_clips: bool = True, log=None):
+                                render_clips: bool = True, log=None, preferred: str = ""):
     """STEP 1 공통 로직: 모드(tenbagger/history/auto/일반)별 주제·문맥·에셋클립을 확정한다.
     반환: (prompt_topic, context_data, asset_clips). asset_clips는 {source_type: mp4경로} dict.
     대본 프리뷰와 풀 파이프라인이 공유. render_clips=False 면 클립 렌더 생략(프리뷰)."""
@@ -1006,14 +1020,16 @@ async def resolve_topic_context(topic: str, chart_dir: str = None,
         _l("텐배거 추천 종목 조회 중...")
         history_topics = [item['topic'] for item in load_history()]
         prompt_topic, context_data, asset_clips = await pick_tenbagger_topic(
-            exclude_topics=history_topics, clip_dir=cdir, render_clips=render_clips
+            exclude_topics=history_topics, clip_dir=cdir, render_clips=render_clips,
+            preferred=preferred
         )
         _l(f"주제 확정: {prompt_topic}" + (" (분석 카드 포함)" if asset_clips.get("card") else ""))
     elif topic.lower() == "history":
         _l("과거 텐배거 종목 선정 + 백테스트 조회 중...")
         history_topics = [item['topic'] for item in load_history()]
         prompt_topic, context_data, asset_clips = await pick_history_topic(
-            exclude_topics=history_topics, chart_dir=cdir, render_clips=render_clips
+            exclude_topics=history_topics, chart_dir=cdir, render_clips=render_clips,
+            preferred=preferred
         )
         extras = "+".join(k for k in ("card", "chart") if asset_clips.get(k))
         _l(f"주제 확정: {prompt_topic}" + (f" ({extras} 포함)" if extras else ""))
@@ -1035,7 +1051,7 @@ async def resolve_topic_context(topic: str, chart_dir: str = None,
 
 async def step_4_automation_pipeline(job_id: str, topic: str,
                                      preset_scenes: list = None,
-                                     preset_title: str = None):
+                                     preset_title: str = None, preferred: str = ""):
     """메인 자동화 파이프라인 - Step별 타이밍 기록 + 실시간 로그 축적.
     preset_scenes 가 주어지면 STEP 2(GPT 대본 생성)를 건너뛰고 그 대본을 그대로 렌더링한다
     ('대본만 보기'로 검증한 대본을 GPT 재생성 없이 바로 영상화 — WYSIWYG)."""
@@ -1070,7 +1086,7 @@ async def step_4_automation_pipeline(job_id: str, topic: str,
         jobs[job_id].update({"status": "Step 1: 주제 선정 및 리서치 중...", "progress": 10})
         chart_dir = os.path.join(ASSETS_DIR, job_id)
         prompt_topic, context_data, asset_clips = await resolve_topic_context(
-            topic, chart_dir=chart_dir, render_clips=True, log=_log
+            topic, chart_dir=chart_dir, render_clips=True, log=_log, preferred=preferred
         )
         _end_step(1)
         
@@ -1141,14 +1157,14 @@ async def step_4_automation_pipeline(job_id: str, topic: str,
         # ===== STEP 4: TTS 음성 생성 =====
         _start_step(4, "TTS 음성 생성")
         jobs[job_id].update({"status": "Step 4: 나레이션 오디오 추출 중 (TTS)...", "progress": 65})
-        audio_local_path, narrations = await step_3_audio_and_edit(script_data, output_dir=job_dir)
+        audio_local_path, narrations, scene_durations = await step_3_audio_and_edit(script_data, output_dir=job_dir)
         _end_step(4)
         
         # ===== STEP 5: 영상 렌더링 및 자막 합성 =====
         _start_step(5, "영상 렌더링 및 자막 합성")
         jobs[job_id].update({"status": "Step 5: 비디오 인코딩 및 자막 합성 중...", "progress": 80})
         if audio_local_path:
-            final_result = await step_4_assemble_video(video_local_paths, audio_local_path, narrations, top_title, output_dir=job_dir, disclaimer_text=disclaimer_text)
+            final_result = await step_4_assemble_video(video_local_paths, audio_local_path, narrations, top_title, scene_durations, output_dir=job_dir, disclaimer_text=disclaimer_text)
             jobs[job_id]["video_url"] = final_result.get("video_url")
             jobs[job_id]["thumbnail_url"] = final_result.get("thumbnail_url")
             _log(f"영상 렌더링 완료: {final_result.get('video_url')}", "success")
@@ -1329,6 +1345,7 @@ async def serve_frontend():
 @app.post("/api/pipeline/start")
 async def create_shorts(request_data: ShortsRequest, background_tasks: BackgroundTasks):
     topic = request_data.topic
+    preferred = request_data.preferred
     
     # 히스토리 기록
     save_history(topic)
@@ -1336,7 +1353,7 @@ async def create_shorts(request_data: ShortsRequest, background_tasks: Backgroun
     job_id = f"job_{int(time.time())}"
     jobs[job_id] = {"status": "Queued", "topic": topic, "progress": 0}
     
-    background_tasks.add_task(step_4_automation_pipeline, job_id, topic)
+    background_tasks.add_task(step_4_automation_pipeline, job_id, topic, preferred=preferred)
     return {"job_id": job_id, "message": "작업 시작"}
 
 @app.post("/api/pipeline/from_script")
@@ -1354,6 +1371,7 @@ async def create_shorts_from_script(request_data: FromScriptRequest, background_
     background_tasks.add_task(
         step_4_automation_pipeline, job_id, topic,
         scenes, request_data.top_title or topic,
+        preferred=request_data.preferred,
     )
     return {"job_id": job_id, "message": "검증된 대본으로 영상 제작 시작"}
 
@@ -1408,7 +1426,9 @@ async def script_preview(request_data: ShortsRequest):
     topic = (request_data.topic or "").strip() or "auto"
     is_history = topic.lower() == "history"
     try:
-        prompt_topic, context_data, _ = await resolve_topic_context(topic, render_clips=False)
+        prompt_topic, context_data, _ = await resolve_topic_context(
+            topic, render_clips=False, preferred=request_data.preferred
+        )
         parsed = await call_openai_script(prompt_topic, context_data)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))

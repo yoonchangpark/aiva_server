@@ -1,4 +1,4 @@
-﻿"""
+"""
 텐배거 헌터 연동 모듈 — "미래 텐배거 추천" 모드
 /api/v2/shorts-feed?mode=candidate 에서 탑다운 발굴 후보를 가져와
 쇼츠 파이프라인의 (주제, 문맥 데이터) 형식으로 변환한다.
@@ -88,7 +88,8 @@ async def _fetch_candidates(base: str, limit: int = 20) -> list[dict]:
 
 async def pick_tenbagger_topic(exclude_topics: list[str] | None = None,
                                clip_dir: str = ".",
-                               render_clips: bool = True) -> tuple[str, str, dict]:
+                               render_clips: bool = True,
+                               preferred: str = "") -> tuple[str, str, dict]:
     """
     shorts-feed(mode=candidate) 목록 중 히스토리에 없는 첫 종목을 골라 (주제, 문맥, asset_clips) 반환.
     asset_clips: {'card': mp4경로} — 영상의 source_type=='card' 씬에 삽입됨.

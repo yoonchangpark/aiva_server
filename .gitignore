@@ -36,3 +36,8 @@ data/broll_rules.json
 
 # 기타
 *.log
+
+# 일회성 작업 파일 (디버깅 패치 스크립트, 추출 프레임 등)
+patch_*.py
+frames/
+review_sheet.png

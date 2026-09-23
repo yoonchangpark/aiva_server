@@ -27,9 +27,10 @@ load_dotenv()
 from evaluator.alignment import evaluate_script, evaluate_history_quality, factcheck_history_script
 from evolution.prompt_engine import load_prompt_rules, evolve_prompt
 from evolution.broll_optimizer import save_broll_evaluation, load_broll_rules
-from analytics.youtube_metrics import get_video_metrics, save_metrics
+from analytics.youtube_metrics import get_video_metrics, save_metrics, refresh_all_metrics
 from tenbagger_topic import pick_tenbagger_topic
 from historical_topic import pick_history_topic
+from review.capture import capture_publish_screenshot, log_published_video, load_published_videos
 import kling_broll
 
 # 로그 설정
@@ -1542,6 +1543,15 @@ async def auto_loop():
                 f"({wait_seconds / 3600:.1f}시간 대기)"
             )
             await asyncio.sleep(max(wait_seconds, 0))
+
+            # 기존에 발행된 영상들의 조회수·좋아요·댓글을 다시 찍어 추이를 쌓는다
+            try:
+                published = load_published_videos()
+                if published:
+                    await refresh_all_metrics(published)
+                    logger.info(f"발행된 영상 {len(published)}건의 메트릭 추이를 갱신했습니다.")
+            except Exception as e:
+                logger.error(f"메트릭 추이 갱신 실패: {e}")
         retry_immediately = False
 
         try:
@@ -1573,6 +1583,14 @@ async def auto_loop():
                         jobs[job_id].get("disclaimer_text", ""),
                     )
                     logger.info(f"YouTube 업로드 완료: video_id={video_id}")
+
+                    # 검토용: 발행된 페이지를 스크린샷으로 남기고 발행 목록에 기록
+                    try:
+                        top_title = jobs[job_id].get("top_title", "텐배거 헌터 숏츠")
+                        screenshot_path = await capture_publish_screenshot(video_id)
+                        log_published_video(video_id, top_title, screenshot_path)
+                    except Exception as e:
+                        logger.error(f"발행 검토 기록 실패 (업로드 자체는 성공): {e}")
                 except Exception as e:
                     logger.error(f"YouTube 업로드 실패 — 이번 회차는 메트릭 수집을 건너뜁니다: {e}")
 
@@ -1582,6 +1600,8 @@ async def auto_loop():
                 continue
 
             metrics = await get_video_metrics(video_id)
+            metrics["title"] = jobs[job_id].get("top_title", "")
+            metrics["checked_at"] = datetime.now().isoformat()
             await save_metrics(metrics)
 
             # 단계 3: 프롬프트 자가 진화 (Engagement Rate 분석)
@@ -1596,9 +1616,8 @@ async def auto_loop():
 @app.on_event("startup")
 async def startup_event():
     import asyncio
-    # 백그라운드 자동 생성 비활성화 (테스트 시 리소스 낭비 방지)
-    # asyncio.create_task(auto_loop())
-    pass
+    # 요일 지정 스케줄(월/수/금 18:30)로 백그라운드 자동 생성·업로드를 가동한다
+    asyncio.create_task(auto_loop())
 
 if __name__ == "__main__":
     import uvicorn

@@ -11,6 +11,7 @@ __pycache__/
 assets/
 ai_images/
 source_videos/
+review/screenshots/
 
 # 테스트 임시 파일
 *.part

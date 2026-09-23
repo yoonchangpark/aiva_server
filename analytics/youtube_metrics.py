@@ -3,6 +3,7 @@ import httpx
 import logging
 import json
 import aiofiles
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -70,3 +71,23 @@ async def save_metrics(data: dict):
 
     async with aiofiles.open(metrics_file, "w", encoding="utf-8") as f:
         await f.write(json.dumps(existing, indent=2, ensure_ascii=False))
+
+
+async def refresh_all_metrics(published_videos: list) -> list:
+    """발행된 영상 전체의 최신 조회수·좋아요·댓글 지표를 다시 조회해 시계열로 누적한다.
+
+    업로드 직후 한 번만 재는 게 아니라, 매 실행 주기마다 이미 올라간 영상들의
+    현재 지표를 다시 찍어 metrics.json에 쌓는다 — 이 누적분으로 조회수/참여도
+    추이를 판단한다.
+    """
+    results = []
+    for record in published_videos:
+        video_id = record.get("video_id")
+        if not video_id:
+            continue
+        metrics = await get_video_metrics(video_id)
+        metrics["title"] = record.get("title", "")
+        metrics["checked_at"] = datetime.now().isoformat()
+        await save_metrics(metrics)
+        results.append(metrics)
+    return results

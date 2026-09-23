@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 import time
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # 로컬 모듈 import 전에 .env 로드 (모듈 최상위에서 os.getenv 하는 모듈들의 키 누락 방지)
@@ -1509,20 +1510,51 @@ async def script_preview(request_data: ShortsRequest):
 async def health_check():
     return {"status": "ok", "message": "Server is running smoothly"}
 
+# 숏츠 제작 스케줄: 요일 지정 방식 (기본 월/수/금 18:30, threads-auto 발행 스케줄과 동일한 요일)
+SCHEDULE_WEEKDAYS = {0, 2, 4}  # Python weekday(): 월=0, 화=1, 수=2, 목=3, 금=4
+SCHEDULE_HOUR = 18
+SCHEDULE_MINUTE = 30
+
+
+def _next_scheduled_run(now: datetime) -> datetime:
+    """now 이후로 가장 가까운 예정 요일·시각을 반환한다."""
+    candidate = now.replace(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    while candidate.weekday() not in SCHEDULE_WEEKDAYS:
+        candidate += timedelta(days=1)
+    return candidate
+
+
 async def auto_loop():
-    """2시간마다 자동으로 파이프라인 -> 메트릭 평가 -> 프롬프트 진화를 반복하는 무한 루프"""
-    logger.info("백그라운드 자가 진화 파이프라인(auto_loop)이 가동됩니다.")
+    """지정한 요일·시각(기본 월/수/금 18:30)마다 파이프라인 -> 메트릭 평가 -> 프롬프트 진화를 반복하는 무한 루프"""
+    logger.info(
+        f"백그라운드 자가 진화 파이프라인(auto_loop)이 가동됩니다. "
+        f"실행 요일: {sorted(SCHEDULE_WEEKDAYS)} (월=0) {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}"
+    )
+    retry_immediately = False
     while True:
+        if not retry_immediately:
+            next_run = _next_scheduled_run(datetime.now())
+            wait_seconds = (next_run - datetime.now()).total_seconds()
+            logger.info(
+                f"다음 실행 예정: {next_run.strftime('%Y-%m-%d(%a) %H:%M')} "
+                f"({wait_seconds / 3600:.1f}시간 대기)"
+            )
+            await asyncio.sleep(max(wait_seconds, 0))
+        retry_immediately = False
+
         try:
             job_id = f"auto_loop_{int(time.time())}"
             jobs[job_id] = {"status": "무한 루프: 영상 생성을 시작합니다", "topic": "auto"}
-            
+
             # 단계 1: 영상 생성 시도
             await step_4_automation_pipeline(job_id, "auto")
 
             if jobs[job_id]["status"].startswith("Rejected"):
                 logger.warning("오토루프: 대본 퀄리티 미달로 생성을 건너뜁니다. 5분 뒤 다시 시도합니다.")
                 await asyncio.sleep(300)
+                retry_immediately = True
                 continue
 
             # 단계 2: YouTube 업로드
@@ -1546,6 +1578,7 @@ async def auto_loop():
 
             if not video_id:
                 await asyncio.sleep(300)
+                retry_immediately = True
                 continue
 
             metrics = await get_video_metrics(video_id)
@@ -1558,9 +1591,7 @@ async def auto_loop():
         except Exception as e:
             logger.error(f"오토 루프 수행 중 에러 발생: {e}")
 
-        # 다음 주기까지 2시간(7200초) 대기
-        logger.info("한 사이클(생성->수집->진화)을 완료했습니다. 2시간 대기합니다.")
-        await asyncio.sleep(7200)
+        logger.info("한 사이클(생성->수집->진화)을 완료했습니다. 다음 예정 요일까지 대기합니다.")
 
 @app.on_event("startup")
 async def startup_event():

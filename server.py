@@ -1135,13 +1135,15 @@ async def step_4_automation_pipeline(job_id: str, topic: str,
         
         display_script = f"# 제목: {top_title}\n\n" + "\n\n".join([f"[SCENE {scene.get('scene_num', i+1)}]\nSEARCH: {scene.get('search', '')}\nNARRATION: {scene.get('narration', '')}" for i, scene in enumerate(script_data)])
         jobs[job_id]["script"] = display_script
+        jobs[job_id]["top_title"] = top_title  # YouTube 업로드 시 제목으로 쓴다
         _end_step(2)
-        
+
         # disclaimer 씬 분리 — TTS/B-roll 제외, 영상 하단 자막 오버레이로만 처리
         disclaimer_text = next(
             (s.get("narration", "") for s in script_data if s.get("source_type") == "disclaimer"),
             ""
         )
+        jobs[job_id]["disclaimer_text"] = disclaimer_text  # YouTube 업로드 시 설명란에 쓴다
 
         # ===== STEP 3: B-roll 영상 다운로드 =====
         _start_step(3, "B-roll 영상 다운로드")
@@ -1516,18 +1518,36 @@ async def auto_loop():
             jobs[job_id] = {"status": "무한 루프: 영상 생성을 시작합니다", "topic": "auto"}
             
             # 단계 1: 영상 생성 시도
-            final_video_path = await step_4_automation_pipeline(job_id, "auto")
-            
+            await step_4_automation_pipeline(job_id, "auto")
+
             if jobs[job_id]["status"].startswith("Rejected"):
                 logger.warning("오토루프: 대본 퀄리티 미달로 생성을 건너뜁니다. 5분 뒤 다시 시도합니다.")
                 await asyncio.sleep(300)
                 continue
 
-            # (TODO: 유튜브 업로드 API 호출 기능 추가 요망)
-            # 단계 2: 업로드 완료를 가정하고 metrics 수집
-            video_id = "test_auto_id"
-            logger.info("업로드 처리 완료. 메트릭을 수집합니다.")
-            
+            # 단계 2: YouTube 업로드
+            video_rel_url = jobs[job_id].get("video_url")
+            video_id = None
+            if not video_rel_url:
+                logger.warning("렌더링된 영상 경로가 없어 업로드를 건너뜁니다.")
+            else:
+                video_abs_path = os.path.join(BASE_DIR, video_rel_url.lstrip("/"))
+                try:
+                    import youtube_uploader
+                    video_id = await asyncio.to_thread(
+                        youtube_uploader.upload_video,
+                        video_abs_path,
+                        jobs[job_id].get("top_title", "텐배거 헌터 숏츠"),
+                        jobs[job_id].get("disclaimer_text", ""),
+                    )
+                    logger.info(f"YouTube 업로드 완료: video_id={video_id}")
+                except Exception as e:
+                    logger.error(f"YouTube 업로드 실패 — 이번 회차는 메트릭 수집을 건너뜁니다: {e}")
+
+            if not video_id:
+                await asyncio.sleep(300)
+                continue
+
             metrics = await get_video_metrics(video_id)
             await save_metrics(metrics)
 

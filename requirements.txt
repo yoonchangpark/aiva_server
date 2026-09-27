@@ -12,7 +12,7 @@ yahooquery>=2.4.1
 playwright==1.51.0
 gTTS==2.5.4
 pydub==0.25.1
-audioop-lts==0.2.1
+audioop-lts==0.2.1; python_version>="3.13"
 matplotlib>=3.10.7
 google-api-python-client==2.149.0
 google-auth-httplib2==0.2.0

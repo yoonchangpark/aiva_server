@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 import time
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # 로컬 모듈 import 전에 .env 로드 (모듈 최상위에서 os.getenv 하는 모듈들의 키 누락 방지)
@@ -26,9 +27,10 @@ load_dotenv()
 from evaluator.alignment import evaluate_script, evaluate_history_quality, factcheck_history_script
 from evolution.prompt_engine import load_prompt_rules, evolve_prompt
 from evolution.broll_optimizer import save_broll_evaluation, load_broll_rules
-from analytics.youtube_metrics import get_video_metrics, save_metrics
+from analytics.youtube_metrics import get_video_metrics, save_metrics, refresh_all_metrics
 from tenbagger_topic import pick_tenbagger_topic
 from historical_topic import pick_history_topic
+from review.capture import capture_publish_screenshot, log_published_video, load_published_videos
 import kling_broll
 
 # 로그 설정
@@ -1135,13 +1137,15 @@ async def step_4_automation_pipeline(job_id: str, topic: str,
         
         display_script = f"# 제목: {top_title}\n\n" + "\n\n".join([f"[SCENE {scene.get('scene_num', i+1)}]\nSEARCH: {scene.get('search', '')}\nNARRATION: {scene.get('narration', '')}" for i, scene in enumerate(script_data)])
         jobs[job_id]["script"] = display_script
+        jobs[job_id]["top_title"] = top_title  # YouTube 업로드 시 제목으로 쓴다
         _end_step(2)
-        
+
         # disclaimer 씬 분리 — TTS/B-roll 제외, 영상 하단 자막 오버레이로만 처리
         disclaimer_text = next(
             (s.get("narration", "") for s in script_data if s.get("source_type") == "disclaimer"),
             ""
         )
+        jobs[job_id]["disclaimer_text"] = disclaimer_text  # YouTube 업로드 시 설명란에 쓴다
 
         # ===== STEP 3: B-roll 영상 다운로드 =====
         _start_step(3, "B-roll 영상 다운로드")
@@ -1507,28 +1511,97 @@ async def script_preview(request_data: ShortsRequest):
 async def health_check():
     return {"status": "ok", "message": "Server is running smoothly"}
 
+# 숏츠 제작 스케줄: 요일 지정 방식 (기본 월/수/금 18:30, threads-auto 발행 스케줄과 동일한 요일)
+SCHEDULE_WEEKDAYS = {0, 2, 4}  # Python weekday(): 월=0, 화=1, 수=2, 목=3, 금=4
+SCHEDULE_HOUR = 18
+SCHEDULE_MINUTE = 30
+
+
+def _next_scheduled_run(now: datetime) -> datetime:
+    """now 이후로 가장 가까운 예정 요일·시각을 반환한다."""
+    candidate = now.replace(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    while candidate.weekday() not in SCHEDULE_WEEKDAYS:
+        candidate += timedelta(days=1)
+    return candidate
+
+
 async def auto_loop():
-    """2시간마다 자동으로 파이프라인 -> 메트릭 평가 -> 프롬프트 진화를 반복하는 무한 루프"""
-    logger.info("백그라운드 자가 진화 파이프라인(auto_loop)이 가동됩니다.")
+    """지정한 요일·시각(기본 월/수/금 18:30)마다 파이프라인 -> 메트릭 평가 -> 프롬프트 진화를 반복하는 무한 루프"""
+    logger.info(
+        f"백그라운드 자가 진화 파이프라인(auto_loop)이 가동됩니다. "
+        f"실행 요일: {sorted(SCHEDULE_WEEKDAYS)} (월=0) {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}"
+    )
+    retry_immediately = False
     while True:
+        if not retry_immediately:
+            next_run = _next_scheduled_run(datetime.now())
+            wait_seconds = (next_run - datetime.now()).total_seconds()
+            logger.info(
+                f"다음 실행 예정: {next_run.strftime('%Y-%m-%d(%a) %H:%M')} "
+                f"({wait_seconds / 3600:.1f}시간 대기)"
+            )
+            await asyncio.sleep(max(wait_seconds, 0))
+
+            # 기존에 발행된 영상들의 조회수·좋아요·댓글을 다시 찍어 추이를 쌓는다
+            try:
+                published = load_published_videos()
+                if published:
+                    await refresh_all_metrics(published)
+                    logger.info(f"발행된 영상 {len(published)}건의 메트릭 추이를 갱신했습니다.")
+            except Exception as e:
+                logger.error(f"메트릭 추이 갱신 실패: {e}")
+        retry_immediately = False
+
         try:
             job_id = f"auto_loop_{int(time.time())}"
             jobs[job_id] = {"status": "무한 루프: 영상 생성을 시작합니다", "topic": "auto"}
-            
+
             # 단계 1: 영상 생성 시도
-            final_video_path = await step_4_automation_pipeline(job_id, "auto")
-            
+            await step_4_automation_pipeline(job_id, "auto")
+
             if jobs[job_id]["status"].startswith("Rejected"):
                 logger.warning("오토루프: 대본 퀄리티 미달로 생성을 건너뜁니다. 5분 뒤 다시 시도합니다.")
                 await asyncio.sleep(300)
+                retry_immediately = True
                 continue
 
-            # (TODO: 유튜브 업로드 API 호출 기능 추가 요망)
-            # 단계 2: 업로드 완료를 가정하고 metrics 수집
-            video_id = "test_auto_id"
-            logger.info("업로드 처리 완료. 메트릭을 수집합니다.")
-            
+            # 단계 2: YouTube 업로드
+            video_rel_url = jobs[job_id].get("video_url")
+            video_id = None
+            if not video_rel_url:
+                logger.warning("렌더링된 영상 경로가 없어 업로드를 건너뜁니다.")
+            else:
+                video_abs_path = os.path.join(BASE_DIR, video_rel_url.lstrip("/"))
+                try:
+                    import youtube_uploader
+                    video_id = await asyncio.to_thread(
+                        youtube_uploader.upload_video,
+                        video_abs_path,
+                        jobs[job_id].get("top_title", "텐배거 헌터 숏츠"),
+                        jobs[job_id].get("disclaimer_text", ""),
+                    )
+                    logger.info(f"YouTube 업로드 완료: video_id={video_id}")
+
+                    # 검토용: 발행된 페이지를 스크린샷으로 남기고 발행 목록에 기록
+                    try:
+                        top_title = jobs[job_id].get("top_title", "텐배거 헌터 숏츠")
+                        screenshot_path = await capture_publish_screenshot(video_id)
+                        log_published_video(video_id, top_title, screenshot_path)
+                    except Exception as e:
+                        logger.error(f"발행 검토 기록 실패 (업로드 자체는 성공): {e}")
+                except Exception as e:
+                    logger.error(f"YouTube 업로드 실패 — 이번 회차는 메트릭 수집을 건너뜁니다: {e}")
+
+            if not video_id:
+                await asyncio.sleep(300)
+                retry_immediately = True
+                continue
+
             metrics = await get_video_metrics(video_id)
+            metrics["title"] = jobs[job_id].get("top_title", "")
+            metrics["checked_at"] = datetime.now().isoformat()
             await save_metrics(metrics)
 
             # 단계 3: 프롬프트 자가 진화 (Engagement Rate 분석)
@@ -1538,16 +1611,13 @@ async def auto_loop():
         except Exception as e:
             logger.error(f"오토 루프 수행 중 에러 발생: {e}")
 
-        # 다음 주기까지 2시간(7200초) 대기
-        logger.info("한 사이클(생성->수집->진화)을 완료했습니다. 2시간 대기합니다.")
-        await asyncio.sleep(7200)
+        logger.info("한 사이클(생성->수집->진화)을 완료했습니다. 다음 예정 요일까지 대기합니다.")
 
 @app.on_event("startup")
 async def startup_event():
     import asyncio
-    # 백그라운드 자동 생성 비활성화 (테스트 시 리소스 낭비 방지)
-    # asyncio.create_task(auto_loop())
-    pass
+    # 요일 지정 스케줄(월/수/금 18:30)로 백그라운드 자동 생성·업로드를 가동한다
+    asyncio.create_task(auto_loop())
 
 if __name__ == "__main__":
     import uvicorn

@@ -1527,8 +1527,92 @@ def _next_scheduled_run(now: datetime) -> datetime:
     return candidate
 
 
+async def refresh_published_metrics():
+    """기존에 발행된 영상들의 조회수·좋아요·댓글을 다시 찍어 추이를 쌓는다.
+
+    새 영상을 만들기 전, 스케줄된 한 사이클마다 한 번만 부르면 된다(재시도
+    루프마다 부르면 YouTube API 호출이 낭비된다).
+    """
+    try:
+        published = load_published_videos()
+        if published:
+            await refresh_all_metrics(published)
+            logger.info(f"발행된 영상 {len(published)}건의 메트릭 추이를 갱신했습니다.")
+    except Exception as e:
+        logger.error(f"메트릭 추이 갱신 실패: {e}")
+
+
+async def run_one_cycle() -> str:
+    """영상 생성 -> YouTube 업로드 -> 검토 기록 -> 메트릭 -> 프롬프트 진화, 1회 시도.
+
+    스케줄링(언제 부를지)과 재시도 여부는 호출부가 정한다 — 이 함수는 sleep하지 않고
+    Railway Cron처럼 한 번 실행되고 끝나는 호출부에서도 그대로 쓸 수 있다.
+
+    반환값: "ok" 정상 완료 / "rejected" 대본 반려 / "upload_failed" 업로드·렌더링 실패
+    """
+    try:
+        job_id = f"auto_loop_{int(time.time())}"
+        jobs[job_id] = {"status": "무한 루프: 영상 생성을 시작합니다", "topic": "auto"}
+
+        # 단계 1: 영상 생성 시도
+        await step_4_automation_pipeline(job_id, "auto")
+
+        if jobs[job_id]["status"].startswith("Rejected"):
+            logger.warning("오토루프: 대본 퀄리티 미달로 생성을 건너뜁니다.")
+            return "rejected"
+
+        # 단계 2: YouTube 업로드
+        video_rel_url = jobs[job_id].get("video_url")
+        video_id = None
+        if not video_rel_url:
+            logger.warning("렌더링된 영상 경로가 없어 업로드를 건너뜁니다.")
+        else:
+            video_abs_path = os.path.join(BASE_DIR, video_rel_url.lstrip("/"))
+            try:
+                import youtube_uploader
+                video_id = await asyncio.to_thread(
+                    youtube_uploader.upload_video,
+                    video_abs_path,
+                    jobs[job_id].get("top_title", "텐배거 헌터 숏츠"),
+                    jobs[job_id].get("disclaimer_text", ""),
+                )
+                logger.info(f"YouTube 업로드 완료: video_id={video_id}")
+
+                # 검토용: 발행된 페이지를 스크린샷으로 남기고 발행 목록에 기록
+                try:
+                    top_title = jobs[job_id].get("top_title", "텐배거 헌터 숏츠")
+                    screenshot_path = await capture_publish_screenshot(video_id)
+                    log_published_video(video_id, top_title, screenshot_path)
+                except Exception as e:
+                    logger.error(f"발행 검토 기록 실패 (업로드 자체는 성공): {e}")
+            except Exception as e:
+                logger.error(f"YouTube 업로드 실패 — 이번 회차는 메트릭 수집을 건너뜁니다: {e}")
+
+        if not video_id:
+            return "upload_failed"
+
+        metrics = await get_video_metrics(video_id)
+        metrics["title"] = jobs[job_id].get("top_title", "")
+        metrics["checked_at"] = datetime.now().isoformat()
+        await save_metrics(metrics)
+
+        # 단계 3: 프롬프트 자가 진화 (Engagement Rate 분석)
+        logger.info("성과 분석 및 프롬프트 규칙 진화 시작...")
+        await evolve_prompt()
+        return "ok"
+
+    except Exception as e:
+        logger.error(f"오토 루프 수행 중 에러 발생: {e}")
+        return "error"
+
+
 async def auto_loop():
-    """지정한 요일·시각(기본 월/수/금 18:30)마다 파이프라인 -> 메트릭 평가 -> 프롬프트 진화를 반복하는 무한 루프"""
+    """지정한 요일·시각(기본 월/수/금 18:30)마다 run_one_cycle()을 반복 실행하는 무한 루프.
+
+    로컬에서 서버를 계속 켜두고 쓸 때를 위한 폴백이다 — 실제 정기 발행은
+    Railway Cron(`run_scheduled_publish.py`)이 담당하므로 기본은 비활성화돼 있다
+    (startup_event 참고). 둘 다 켜두면 같은 시각에 중복 발행될 수 있다.
+    """
     logger.info(
         f"백그라운드 자가 진화 파이프라인(auto_loop)이 가동됩니다. "
         f"실행 요일: {sorted(SCHEDULE_WEEKDAYS)} (월=0) {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}"
@@ -1543,81 +1627,26 @@ async def auto_loop():
                 f"({wait_seconds / 3600:.1f}시간 대기)"
             )
             await asyncio.sleep(max(wait_seconds, 0))
+            await refresh_published_metrics()
 
-            # 기존에 발행된 영상들의 조회수·좋아요·댓글을 다시 찍어 추이를 쌓는다
-            try:
-                published = load_published_videos()
-                if published:
-                    await refresh_all_metrics(published)
-                    logger.info(f"발행된 영상 {len(published)}건의 메트릭 추이를 갱신했습니다.")
-            except Exception as e:
-                logger.error(f"메트릭 추이 갱신 실패: {e}")
-        retry_immediately = False
-
-        try:
-            job_id = f"auto_loop_{int(time.time())}"
-            jobs[job_id] = {"status": "무한 루프: 영상 생성을 시작합니다", "topic": "auto"}
-
-            # 단계 1: 영상 생성 시도
-            await step_4_automation_pipeline(job_id, "auto")
-
-            if jobs[job_id]["status"].startswith("Rejected"):
-                logger.warning("오토루프: 대본 퀄리티 미달로 생성을 건너뜁니다. 5분 뒤 다시 시도합니다.")
-                await asyncio.sleep(300)
-                retry_immediately = True
-                continue
-
-            # 단계 2: YouTube 업로드
-            video_rel_url = jobs[job_id].get("video_url")
-            video_id = None
-            if not video_rel_url:
-                logger.warning("렌더링된 영상 경로가 없어 업로드를 건너뜁니다.")
-            else:
-                video_abs_path = os.path.join(BASE_DIR, video_rel_url.lstrip("/"))
-                try:
-                    import youtube_uploader
-                    video_id = await asyncio.to_thread(
-                        youtube_uploader.upload_video,
-                        video_abs_path,
-                        jobs[job_id].get("top_title", "텐배거 헌터 숏츠"),
-                        jobs[job_id].get("disclaimer_text", ""),
-                    )
-                    logger.info(f"YouTube 업로드 완료: video_id={video_id}")
-
-                    # 검토용: 발행된 페이지를 스크린샷으로 남기고 발행 목록에 기록
-                    try:
-                        top_title = jobs[job_id].get("top_title", "텐배거 헌터 숏츠")
-                        screenshot_path = await capture_publish_screenshot(video_id)
-                        log_published_video(video_id, top_title, screenshot_path)
-                    except Exception as e:
-                        logger.error(f"발행 검토 기록 실패 (업로드 자체는 성공): {e}")
-                except Exception as e:
-                    logger.error(f"YouTube 업로드 실패 — 이번 회차는 메트릭 수집을 건너뜁니다: {e}")
-
-            if not video_id:
-                await asyncio.sleep(300)
-                retry_immediately = True
-                continue
-
-            metrics = await get_video_metrics(video_id)
-            metrics["title"] = jobs[job_id].get("top_title", "")
-            metrics["checked_at"] = datetime.now().isoformat()
-            await save_metrics(metrics)
-
-            # 단계 3: 프롬프트 자가 진화 (Engagement Rate 분석)
-            logger.info("성과 분석 및 프롬프트 규칙 진화 시작...")
-            await evolve_prompt()
-
-        except Exception as e:
-            logger.error(f"오토 루프 수행 중 에러 발생: {e}")
+        status = await run_one_cycle()
+        if status in ("rejected", "upload_failed"):
+            logger.warning("5분 뒤 다시 시도합니다.")
+            await asyncio.sleep(300)
+            retry_immediately = True
+        else:
+            retry_immediately = False
 
         logger.info("한 사이클(생성->수집->진화)을 완료했습니다. 다음 예정 요일까지 대기합니다.")
 
 @app.on_event("startup")
 async def startup_event():
-    import asyncio
-    # 요일 지정 스케줄(월/수/금 18:30)로 백그라운드 자동 생성·업로드를 가동한다
-    asyncio.create_task(auto_loop())
+    # 요일 지정 정기 발행은 Railway Cron(run_scheduled_publish.py)이 담당한다.
+    # 로컬 서버(대시보드·수동 API용)에서 auto_loop까지 같이 켜면 같은 시각에
+    # 중복 발행될 수 있어 기본은 꺼둔다. 로컬에서만 상시 자동화하고 싶다면
+    # (Railway Cron 없이) 아래 줄의 주석을 해제한다.
+    # asyncio.create_task(auto_loop())
+    pass
 
 if __name__ == "__main__":
     import uvicorn

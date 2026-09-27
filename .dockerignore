@@ -1,0 +1,14 @@
+.git
+__pycache__/
+*.pyc
+assets/
+ai_images/
+source_videos/
+review/screenshots/
+*.mp4
+*.log
+.env
+client_secret.json
+token.json
+dev.bat
+dev.ps1

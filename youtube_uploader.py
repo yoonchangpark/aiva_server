@@ -34,10 +34,30 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 DEFAULT_DISCLAIMER = "이 영상은 재무 데이터 기반 분석이며 투자 권유가 아닙니다. 투자 판단의 책임은 본인에게 있습니다."
 
 
+def _materialize_credentials_from_env() -> None:
+    """Railway처럼 로컬 파일(client_secret.json/token.json)을 커밋·배치할 수 없는
+    환경을 위해, 환경변수(YOUTUBE_CLIENT_SECRET_JSON/YOUTUBE_TOKEN_JSON)로 받은
+    JSON 내용을 파일로 써준다. 파일이 이미 있으면(로컬 개발) 아무것도 하지 않는다.
+    """
+    if not os.path.exists(CLIENT_SECRET_FILE):
+        raw = os.getenv("YOUTUBE_CLIENT_SECRET_JSON")
+        if raw:
+            with open(CLIENT_SECRET_FILE, "w", encoding="utf-8") as f:
+                f.write(raw)
+
+    if not os.path.exists(TOKEN_FILE):
+        raw = os.getenv("YOUTUBE_TOKEN_JSON")
+        if raw:
+            with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+                f.write(raw)
+
+
 def _load_credentials():
     """저장된 토큰으로 인증 정보를 만든다. 만료됐으면 자동 갱신한다."""
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
+
+    _materialize_credentials_from_env()
 
     if not os.path.exists(TOKEN_FILE):
         return None

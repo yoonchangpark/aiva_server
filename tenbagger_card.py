@@ -30,8 +30,10 @@ def _load_font(size, bold=True):
         except IOError:
             continue
     try:
-        return ImageFont.truetype("NanumGothicBold.ttf", size)
+        return ImageFont.truetype("NanumGothicBold.ttf", size)  # Railway: Dockerfile의 fonts-nanum
     except IOError:
+        import qc
+        qc.RUN["font_fallback"] = True
         return ImageFont.load_default()
 
 

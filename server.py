@@ -548,7 +548,13 @@ async def step_3_audio_and_edit(script_data: list, force_free_tts: bool = False,
                         "use_speaker_boost": True
                     }
                 }
-                response = await client.post(url, json=payload, headers=headers, timeout=60.0)
+                # 동시 호출 한도를 넘으면 429가 나는데, 바로 gTTS로 넘기면 한 영상 안에서 목소리가 바뀐다
+                # (2026-11-23 업로드분). 429는 잠깐 기다렸다 다시 시도한다.
+                for attempt in range(4):
+                    response = await client.post(url, json=payload, headers=headers, timeout=60.0)
+                    if response.status_code != 429:
+                        break
+                    await asyncio.sleep(2 * (attempt + 1))
                 response.raise_for_status()
                 async with aiofiles.open(scene_path, "wb") as f:
                     await f.write(response.content)
@@ -560,7 +566,7 @@ async def step_3_audio_and_edit(script_data: list, force_free_tts: bool = False,
                 await asyncio.to_thread(run_gtts)
         return scene_path
 
-    semaphore = asyncio.Semaphore(4)  # ElevenLabs 동시 호출 제한(레이트리밋 방지)
+    semaphore = asyncio.Semaphore(2)  # ElevenLabs 동시 호출 제한(무료·Starter 요금제 한도에 맞춤)
     async with httpx.AsyncClient() as client:
         scene_paths = await asyncio.gather(
             *[synth_scene(client, i, text, semaphore) for i, text in enumerate(narration_parts)]
@@ -755,13 +761,14 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         overlays = [video_track]
         
         def _load_title_font(size):
-            try:
-                return ImageFont.truetype("malgunbd.ttf", size)
-            except IOError:
+            # 윈도우(맑은 고딕) → 리눅스 Railway(나눔고딕, Dockerfile에서 설치) 순. 둘 다 없으면 기본 비트맵 글꼴이라
+            # 크기 지정이 안 되고 한글도 안 나온다(2026-11-23 자막이 깨알처럼 나온 원인).
+            for f in ("malgunbd.ttf", "malgun.ttf", "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"):
                 try:
-                    return ImageFont.truetype("malgun.ttf", size)
+                    return ImageFont.truetype(f, size)
                 except IOError:
-                    return ImageFont.load_default()
+                    continue
+            return ImageFont.load_default()
 
         def create_title_image(text, width=1080, height=350):
             img = Image.new('RGBA', (width, height), (0,0,0,0))
@@ -855,13 +862,14 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         overlays.append(dim_box)
                 
         def _load_subtitle_font(size):
-            try:
-                return ImageFont.truetype("malgunbd.ttf", size)
-            except IOError:
+            # 윈도우(맑은 고딕) → 리눅스 Railway(나눔고딕, Dockerfile에서 설치) 순. 둘 다 없으면 기본 비트맵 글꼴이라
+            # 크기 지정이 안 되고 한글도 안 나온다(2026-11-23 자막이 깨알처럼 나온 원인).
+            for f in ("malgunbd.ttf", "malgun.ttf", "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"):
                 try:
-                    return ImageFont.truetype("malgun.ttf", size)
+                    return ImageFont.truetype(f, size)
                 except IOError:
-                    return ImageFont.load_default()
+                    continue
+            return ImageFont.load_default()
 
         def create_text_image(text, width=1080, height=300):
             img = Image.new('RGBA', (width, height), (0,0,0,0))

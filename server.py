@@ -237,13 +237,11 @@ async def step_2_download_background_video(script_data: list, output_dir: str = 
     import os
     import time
     import asyncio
-    import google.generativeai as genai
     from PIL import Image
     import io
 
-    # 제미나이 설정
-    genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    model = genai.GenerativeModel("gemini-2.5-pro")
+    # 배경 영상 심사는 OpenAI gpt-4o-mini로 한다(2026-11: Gemini 선불 크레딧 소진으로 매 씬 심사가 실패해
+    # 검색 결과 1번이 무조건 들어갔다. 대본에 이미 쓰는 OpenAI 키를 재사용하고, 썸네일은 저해상도로 보내 비용을 줄인다).
 
     async def _fetch_pexels_candidates(query: str):
         candidates = []
@@ -320,12 +318,23 @@ async def step_2_download_background_video(script_data: list, output_dir: str = 
 }}"""
 
         try:
-            response = await asyncio.to_thread(
-                model.generate_content,
-                valid_images + [prompt],
-                request_options={"timeout": 60}
-            )
-            resp_text = response.text.replace("```json", "").replace("```", "").strip()
+            content = [{"type": "text", "text": prompt}] + [
+                {"type": "image_url", "image_url": {"url": c["thumb_url"], "detail": "low"}}
+                for c in valid_candidates
+            ]
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": "gpt-4o-mini",
+                        "response_format": {"type": "json_object"},
+                        "messages": [{"role": "user", "content": content}],
+                    },
+                    timeout=60.0,
+                )
+                resp.raise_for_status()
+            resp_text = resp.json()["choices"][0]["message"]["content"].replace("```json", "").replace("```", "").strip()
             data = json.loads(resp_text)
             best_idx = data.get("best_index", 1)
             reason = data.get("reason", "No reason provided")
@@ -348,7 +357,7 @@ async def step_2_download_background_video(script_data: list, output_dir: str = 
             return best_c
             
         except Exception as e:
-            logger.warning(f"제미나이 썸네일 심사 오류 (1번째 강제진행): {e}")
+            logger.warning(f"썸네일 심사 오류 (1번째 강제진행): {e}")
             return valid_candidates[0]
 
     async def _download_final_video(candidate: dict, path: str):

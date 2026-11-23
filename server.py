@@ -261,7 +261,13 @@ async def step_2_download_background_video(script_data: list, output_dir: str = 
                     for idx, v in enumerate(data.get("videos", [])):
                         valid_files = [f for f in v.get("video_files", []) if f.get("file_type") == "video/mp4"]
                         if valid_files:
-                            best_file = max(valid_files, key=lambda x: x.get("width", 0) * x.get("height", 0))
+                            # 최종 영상은 1080x1920이다. 가장 큰 파일(4K)을 고르면 디코딩 프레임 하나가 약 26MB라
+                            # 렌더 중 메모리를 크게 먹는다(2026-11 크론 실패 로그에서 이 지점에서 프레임 읽기가 끊김).
+                            # 짧은 변이 1080 이상인 것 중 가장 작은 파일을 쓰고, 없으면 가장 큰 파일을 쓴다.
+                            def _area(x):
+                                return x.get("width", 0) * x.get("height", 0)
+                            enough = [f for f in valid_files if min(f.get("width", 0), f.get("height", 0)) >= 1080]
+                            best_file = min(enough, key=_area) if enough else max(valid_files, key=_area)
                             candidates.append({
                                 "id": f"pex_{idx}",
                                 "thumb_url": v.get("image"),

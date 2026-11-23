@@ -55,9 +55,9 @@ def _openai_json(content: list, timeout: float = 60.0) -> dict:
 # ---------- 주제 겹침 ----------
 
 def recent_channel_titles(limit: int = 10) -> list[str]:
-    """채널 공개 RSS에서 최근 업로드 제목을 읽는다. YOUTUBE_CHANNEL_ID(UC로 시작)가 필요하다.
+    """채널 공개 RSS에서 최근 업로드 제목을 읽는다. 채널 ID는 YOUTUBE_CHANNEL_ID로 바꿀 수 있다.
     서버에 저장 공간이 없어 '이미 쓴 주제' 기록이 매 실행 지워지므로, 채널 자체를 기록으로 쓴다."""
-    channel_id = os.getenv("YOUTUBE_CHANNEL_ID", "").strip()
+    channel_id = os.getenv("YOUTUBE_CHANNEL_ID", "UCGGuQPJfcNclcsM08UunCkg").strip()  # 기본값: 오너 채널(공개 ID)
     if not channel_id:
         logger.warning("QC: YOUTUBE_CHANNEL_ID가 없어 주제 겹침을 확인할 수 없습니다.")
         return []

@@ -32,6 +32,7 @@ from tenbagger_topic import pick_tenbagger_topic
 from historical_topic import pick_history_topic
 from review.capture import capture_publish_screenshot, log_published_video, load_published_videos
 import kling_broll
+import qc
 
 # 로그 설정
 logging.basicConfig(level=logging.INFO)
@@ -548,19 +549,28 @@ async def step_3_audio_and_edit(script_data: list, force_free_tts: bool = False,
                         "use_speaker_boost": True
                     }
                 }
-                response = await client.post(url, json=payload, headers=headers, timeout=60.0)
+                # 동시 호출 한도를 넘으면 429가 나는데, 바로 gTTS로 넘기면 한 영상 안에서 목소리가 바뀐다
+                # (2026-11-23 업로드분). 429는 잠깐 기다렸다 다시 시도한다.
+                for attempt in range(4):
+                    response = await client.post(url, json=payload, headers=headers, timeout=60.0)
+                    if response.status_code != 429:
+                        break
+                    await asyncio.sleep(2 * (attempt + 1))
                 response.raise_for_status()
                 async with aiofiles.open(scene_path, "wb") as f:
                     await f.write(response.content)
             except Exception as e:
                 logger.warning(f"[Scene {idx+1}] ElevenLabs TTS 에러({e}). gTTS로 우회합니다.")
+                if not force_free_tts:
+                    qc.RUN["tts_fallback_scenes"].append(idx + 1)
                 def run_gtts():
                     from gtts import gTTS
                     gTTS(text=text, lang='ko').save(scene_path)
                 await asyncio.to_thread(run_gtts)
         return scene_path
 
-    semaphore = asyncio.Semaphore(4)  # ElevenLabs 동시 호출 제한(레이트리밋 방지)
+    qc.RUN["tts_total"] = len(narration_parts)
+    semaphore = asyncio.Semaphore(2)  # ElevenLabs 동시 호출 제한(무료·Starter 요금제 한도에 맞춤)
     async with httpx.AsyncClient() as client:
         scene_paths = await asyncio.gather(
             *[synth_scene(client, i, text, semaphore) for i, text in enumerate(narration_parts)]
@@ -661,11 +671,17 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         
         if valid_paths:
             loaded_clips = []
+            clip_by_scene = {}  # 씬 번호 → 그 씬 나레이션에 맞춰 고른 클립 (파일명 끝 _{씬번호}.mp4)
             for p in valid_paths:
                 try:
-                    loaded_clips.append(VideoFileClip(p))
+                    clip = VideoFileClip(p)
                 except Exception as e:
                     logger.warning(f"비디오 로딩 에러: {e}")
+                    continue
+                loaded_clips.append(clip)
+                m = re.search(r"_(\d+)\.mp4$", p)
+                if m:
+                    clip_by_scene[int(m.group(1))] = clip
                     
             if loaded_clips:
                 current_time = 0.0
@@ -694,12 +710,22 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
                 
                 logger.info(f"[클립 그룹핑] {len(narrations)}개 씬 → {len(visual_groups)}개 비주얼 그룹 (최소 {MIN_CLIP_DURATION}초 보장)")
                 
+                qc.RUN["samples"] = []
                 for group_source_idx, group_duration, scene_indices in visual_groups:
+                    qc.RUN["samples"].append((
+                        current_time + group_duration / 2,
+                        " ".join(narrations[i] for i in scene_indices if i < len(narrations)),
+                    ))
                     if sfx_clip_base:
                         sfx = sfx_clip_base.set_start(current_time)
                         audio_clips_to_mix.append(sfx)
                     
-                    source_clip = loaded_clips[group_source_idx]
+                    # 그룹 안 씬 중 자기 클립이 있는 첫 씬의 클립을 쓴다. 예전엔 그룹 순번으로 클립을 돌려 써서
+                    # "GPU" 씬용으로 고른 영상이 다른 문장 위에 깔렸다. 맞는 클립이 없을 때만 순번 방식으로 채운다.
+                    source_clip = next(
+                        (clip_by_scene[i] for i in scene_indices if i in clip_by_scene),
+                        loaded_clips[group_source_idx],
+                    )
                     
                     # 원본 비디오 무음 및 길이 조절
                     if source_clip.duration < group_duration:
@@ -744,13 +770,15 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         overlays = [video_track]
         
         def _load_title_font(size):
-            try:
-                return ImageFont.truetype("malgunbd.ttf", size)
-            except IOError:
+            # 윈도우(맑은 고딕) → 리눅스 Railway(나눔고딕, Dockerfile에서 설치) 순. 둘 다 없으면 기본 비트맵 글꼴이라
+            # 크기 지정이 안 되고 한글도 안 나온다(2026-11-23 자막이 깨알처럼 나온 원인).
+            for f in ("malgunbd.ttf", "malgun.ttf", "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"):
                 try:
-                    return ImageFont.truetype("malgun.ttf", size)
+                    return ImageFont.truetype(f, size)
                 except IOError:
-                    return ImageFont.load_default()
+                    continue
+            qc.RUN["font_fallback"] = True
+            return ImageFont.load_default()
 
         def create_title_image(text, width=1080, height=350):
             img = Image.new('RGBA', (width, height), (0,0,0,0))
@@ -844,13 +872,15 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         overlays.append(dim_box)
                 
         def _load_subtitle_font(size):
-            try:
-                return ImageFont.truetype("malgunbd.ttf", size)
-            except IOError:
+            # 윈도우(맑은 고딕) → 리눅스 Railway(나눔고딕, Dockerfile에서 설치) 순. 둘 다 없으면 기본 비트맵 글꼴이라
+            # 크기 지정이 안 되고 한글도 안 나온다(2026-11-23 자막이 깨알처럼 나온 원인).
+            for f in ("malgunbd.ttf", "malgun.ttf", "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"):
                 try:
-                    return ImageFont.truetype("malgun.ttf", size)
+                    return ImageFont.truetype(f, size)
                 except IOError:
-                    return ImageFont.load_default()
+                    continue
+            qc.RUN["font_fallback"] = True
+            return ImageFont.load_default()
 
         def create_text_image(text, width=1080, height=300):
             img = Image.new('RGBA', (width, height), (0,0,0,0))
@@ -1005,7 +1035,7 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         thumb_filename = f"thumbnail_{timestamp}.jpg"
         thumb_path = os.path.join(save_dir, thumb_filename)
         try:
-            final_video.save_frame(thumb_path, t=1.5)
+            final_video.save_frame(thumb_path, t=1.5, withmask=False)  # JPEG는 RGBA를 못 쓴다
             logger.info(f"썸네일 캡처 완료: {thumb_filename}")
         except Exception as e:
             logger.warning(f"썸네일 캡처 실패: {e}")
@@ -1036,11 +1066,18 @@ async def resolve_topic_context(topic: str, chart_dir: str = None,
     if topic.lower() == "tenbagger":
         _l("텐배거 추천 종목 조회 중...")
         history_topics = [item['topic'] for item in load_history()]
-        prompt_topic, context_data, asset_clips = await pick_tenbagger_topic(
-            exclude_topics=history_topics, clip_dir=cdir, render_clips=render_clips,
-            preferred=preferred
-        )
-        _l(f"주제 확정: {prompt_topic}" + (" (분석 카드 포함)" if asset_clips.get("card") else ""))
+        # 서버 기록은 매 실행 지워지므로, 채널 최근 제목에 종목명이 있으면 그 종목도 건너뛴다.
+        history_topics += await asyncio.to_thread(qc.recent_channel_titles)
+        try:
+            prompt_topic, context_data, asset_clips = await pick_tenbagger_topic(
+                exclude_topics=history_topics, clip_dir=cdir, render_clips=render_clips,
+                preferred=preferred
+            )
+            _l(f"주제 확정: {prompt_topic}" + (" (분석 카드 포함)" if asset_clips.get("card") else ""))
+        except Exception as e:
+            # 텐배거 API 장애·후보 소진 시 숏츠를 거르지 않도록 일반 트렌드 주제로 폴백한다.
+            _l(f"텐배거 주제 선정 실패({e}) — 일반 트렌드 주제로 폴백")
+            return await resolve_topic_context("auto", chart_dir, render_clips, log, preferred)
     elif topic.lower() == "history":
         _l("과거 텐배거 종목 선정 + 백테스트 조회 중...")
         history_topics = [item['topic'] for item in load_history()]
@@ -1053,8 +1090,22 @@ async def resolve_topic_context(topic: str, chart_dir: str = None,
     else:
         if topic.lower() == "auto":
             _l("트렌드 티커 자동 수집 중...")
-            trends = data_pipeline.get_trending_topics()
-            prompt_topic = trends[0] if trends else "미국 주식 시장 트렌드"
+            import random
+            trends = data_pipeline.get_trending_topics() or ["미국 주식 시장 트렌드"]
+            trends = (trends + random.sample(FALLBACK_TOPICS, len(FALLBACK_TOPICS)))[:8]
+            # 최근 올린 숏츠와 같은 주제는 건너뛴다(2026-11-23 엔비디아 숏츠가 같은 날 두 편 올라감).
+            recent = await asyncio.to_thread(qc.recent_channel_titles)
+            prompt_topic = None
+            for cand in trends:
+                dup = await asyncio.to_thread(qc.overlapping_title, cand, recent)
+                if not dup:
+                    prompt_topic = cand
+                    break
+                _l(f"주제 건너뜀: '{cand}' — 최근 숏츠 '{dup}'와 겹침")
+                qc.RUN["topic_overlap"] = f"{cand} ↔ {dup}"
+            if prompt_topic is None:
+                raise RuntimeError("QC 차단: 후보 주제가 모두 최근 숏츠와 겹칩니다")
+            qc.RUN["topic_overlap"] = None
         _l(f"주제 확정: {prompt_topic}")
         facts = data_pipeline.fetch_facts_for_topic(prompt_topic)
         _l("NotebookLM 딥 리서치 인사이트 추출 중...")
@@ -1264,25 +1315,28 @@ def save_history(topic):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+# 자동 모드 주제 후보. 트렌드 수집이 실패해도(2026-11 Google Trends 404) 같은 주제만 반복하지 않도록
+# resolve_topic_context()도 이 목록에서 겹치지 않는 주제를 고른다.
+FALLBACK_TOPICS = [
+    "애플이 몰래 준비 중인 2026년 비밀 프로젝트",
+    "워렌 버핏이 현금을 100조나 쌓아둔 진짜 이유",
+    "테슬라 로봇택시가 불러올 끔찍한 나비효과",
+    "엔비디아 젠슨 황이 끝까지 주식을 안 파는 이유",
+    "비트코인 2억 돌파 직전, 고래들의 은밀한 움직임",
+    "폭락장에도 기관들이 쓸어담는 단 하나의 섹터",
+    "월가 전설들이 지금 당장 도망치라고 경고한 자산",
+    "AI 혁명의 진짜 수혜주, 시장이 완전히 속았다",
+    "반도체 슈퍼사이클? 다음 타자는 이 기업입니다",
+    "결국 승리한 구글, 판을 뒤집어버린 충격 발표",
+    "부자들은 이미 돈을 다 빼고 있는 충격적인 데이터",
+    "일론 머스크의 10년 후 마스터플랜, 드디어 공개",
+    "제2의 테슬라, 10배 오르기 직전 조용한 매집",
+    "미국 금리 인하에 환호하면 무조건 물리는 이유",
+    "상위 1%만 알고 있는 2025년 최악의 투자처"
+]
+
 async def pick_auto_topic() -> tuple[str, str]:
     """트렌드 스크래퍼를 실행하고, LLM을 통해 히스토리와 겹치지 않는 바이럴 영상 1개를 선정하여 (주제, URL) 튜플을 반환합니다."""
-    FALLBACK_TOPICS = [
-        "애플이 몰래 준비 중인 2026년 비밀 프로젝트",
-        "워렌 버핏이 현금을 100조나 쌓아둔 진짜 이유",
-        "테슬라 로봇택시가 불러올 끔찍한 나비효과",
-        "엔비디아 젠슨 황이 끝까지 주식을 안 파는 이유",
-        "비트코인 2억 돌파 직전, 고래들의 은밀한 움직임",
-        "폭락장에도 기관들이 쓸어담는 단 하나의 섹터",
-        "월가 전설들이 지금 당장 도망치라고 경고한 자산",
-        "AI 혁명의 진짜 수혜주, 시장이 완전히 속았다",
-        "반도체 슈퍼사이클? 다음 타자는 이 기업입니다",
-        "결국 승리한 구글, 판을 뒤집어버린 충격 발표",
-        "부자들은 이미 돈을 다 빼고 있는 충격적인 데이터",
-        "일론 머스크의 10년 후 마스터플랜, 드디어 공개",
-        "제2의 테슬라, 10배 오르기 직전 조용한 매집",
-        "미국 금리 인하에 환호하면 무조건 물리는 이유",
-        "상위 1%만 알고 있는 2025년 최악의 투자처"
-    ]
     
     history_topics = [item['topic'] for item in load_history()]
     
@@ -1564,13 +1618,17 @@ async def run_one_cycle() -> str:
     Railway Cron처럼 한 번 실행되고 끝나는 호출부에서도 그대로 쓸 수 있다.
 
     반환값: "ok" 정상 완료 / "rejected" 대본 반려 / "upload_failed" 업로드·렌더링 실패
+            / "qc_blocked" 업로드 전 자동 점검(qc.py)에 걸려 올리지 않음
     """
+    qc.reset()
     try:
         job_id = f"auto_loop_{int(time.time())}"
         jobs[job_id] = {"status": "무한 루프: 영상 생성을 시작합니다", "topic": "auto"}
 
         # 단계 1: 영상 생성 시도
-        await step_4_automation_pipeline(job_id, "auto")
+        # 텐배거 종목 주제(분석 카드 포함)로 만든다. 일반 트렌드 숏츠는 62회, 텐배거 숏츠는 1,200회 안팎이었다
+        # (2026-11-23 오너 승인). 텐배거 후보를 못 고르면 resolve_topic_context가 일반 주제로 폴백한다.
+        await step_4_automation_pipeline(job_id, "tenbagger")
 
         if jobs[job_id]["status"].startswith("Rejected"):
             logger.warning("오토루프: 대본 퀄리티 미달로 생성을 건너뜁니다.")
@@ -1583,6 +1641,18 @@ async def run_one_cycle() -> str:
             logger.warning("렌더링된 영상 경로가 없어 업로드를 건너뜁니다.")
         else:
             video_abs_path = os.path.join(BASE_DIR, video_rel_url.lstrip("/"))
+
+            # 업로드 전 자동 점검 — 하나라도 걸리면 올리지 않는다(오너 결정 2026-11-23).
+            qc.RUN["alignment"] = await asyncio.to_thread(
+                qc.score_alignment, video_abs_path, qc.RUN.get("samples", [])
+            )
+            reasons = qc.blocking_reasons()
+            if reasons:
+                for r in reasons:
+                    logger.warning(f"QC 차단: {r}")
+                logger.info(qc.summary_line("qc_blocked", jobs[job_id].get("top_title", "")))
+                return "qc_blocked"
+
             try:
                 import youtube_uploader
                 video_id = await asyncio.to_thread(
@@ -1604,7 +1674,10 @@ async def run_one_cycle() -> str:
                 logger.error(f"YouTube 업로드 실패 — 이번 회차는 메트릭 수집을 건너뜁니다: {e}")
 
         if not video_id:
+            if not video_rel_url:
+                logger.info(qc.summary_line("no_video", jobs[job_id].get("top_title", "")))
             return "upload_failed"
+        logger.info(qc.summary_line("uploaded", jobs[job_id].get("top_title", "")))
 
         metrics = await get_video_metrics(video_id)
         metrics["title"] = jobs[job_id].get("top_title", "")

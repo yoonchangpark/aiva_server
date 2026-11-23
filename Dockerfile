@@ -5,9 +5,10 @@ FROM mcr.microsoft.com/playwright/python:v1.51.0-jammy
 
 WORKDIR /app
 
+# fonts-nanum: 자막·제목용 한글 글꼴(맑은 고딕은 윈도우에만 있다).
 # moviepy(imageio_ffmpeg)가 실행 중에 내려받을 수도 있지만, 매 Cron 실행마다
 # 다시 받지 않도록 이미지에 미리 넣어둔다.
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-nanum \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

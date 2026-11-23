@@ -661,11 +661,17 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         
         if valid_paths:
             loaded_clips = []
+            clip_by_scene = {}  # 씬 번호 → 그 씬 나레이션에 맞춰 고른 클립 (파일명 끝 _{씬번호}.mp4)
             for p in valid_paths:
                 try:
-                    loaded_clips.append(VideoFileClip(p))
+                    clip = VideoFileClip(p)
                 except Exception as e:
                     logger.warning(f"비디오 로딩 에러: {e}")
+                    continue
+                loaded_clips.append(clip)
+                m = re.search(r"_(\d+)\.mp4$", p)
+                if m:
+                    clip_by_scene[int(m.group(1))] = clip
                     
             if loaded_clips:
                 current_time = 0.0
@@ -699,7 +705,12 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
                         sfx = sfx_clip_base.set_start(current_time)
                         audio_clips_to_mix.append(sfx)
                     
-                    source_clip = loaded_clips[group_source_idx]
+                    # 그룹 안 씬 중 자기 클립이 있는 첫 씬의 클립을 쓴다. 예전엔 그룹 순번으로 클립을 돌려 써서
+                    # "GPU" 씬용으로 고른 영상이 다른 문장 위에 깔렸다. 맞는 클립이 없을 때만 순번 방식으로 채운다.
+                    source_clip = next(
+                        (clip_by_scene[i] for i in scene_indices if i in clip_by_scene),
+                        loaded_clips[group_source_idx],
+                    )
                     
                     # 원본 비디오 무음 및 길이 조절
                     if source_clip.duration < group_duration:
@@ -1005,7 +1016,7 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         thumb_filename = f"thumbnail_{timestamp}.jpg"
         thumb_path = os.path.join(save_dir, thumb_filename)
         try:
-            final_video.save_frame(thumb_path, t=1.5)
+            final_video.save_frame(thumb_path, t=1.5, withmask=False)  # JPEG는 RGBA를 못 쓴다
             logger.info(f"썸네일 캡처 완료: {thumb_filename}")
         except Exception as e:
             logger.warning(f"썸네일 캡처 실패: {e}")

@@ -33,6 +33,7 @@ from historical_topic import pick_history_topic
 from review.capture import capture_publish_screenshot, log_published_video, load_published_videos
 import kling_broll
 import qc
+import shorts_template
 
 # 로그 설정
 logging.basicConfig(level=logging.INFO)
@@ -378,6 +379,19 @@ async def step_2_download_background_video(script_data: list, output_dir: str = 
     downloaded_paths = []
     
     save_dir = output_dir if output_dir else ASSETS_DIR
+
+    # 고정 템플릿 모드(텐배거 주제): 스톡 영상 없이 장면마다 졸라맨+데이터 카드를 그린다(2026-11-24 오너 확정).
+    if shorts_template.is_active():
+        spoken = [i for i, s in enumerate(script_data) if s.get("source_type") != "disclaimer"]
+        card_pos = next((k for k, i in enumerate(spoken) if script_data[i].get("source_type") == "card"), None)
+        kinds = shorts_template.assign_kinds(len(spoken), card_pos)
+        ts = int(time.time())
+        for k, idx in enumerate(spoken):
+            path = os.path.join(save_dir, f"bg_{ts}_{kinds[k]}_{idx}.png")  # 끝의 _{idx}로 장면과 매칭
+            if await asyncio.to_thread(shorts_template.render_scene, kinds[k], script_data[idx].get("narration", ""), k, path):
+                downloaded_paths.append(path)
+        logger.info(f"[템플릿] {len(downloaded_paths)}개 장면 렌더: {kinds}")
+        return downloaded_paths
     
     for idx, scene in enumerate(script_data):
         timestamp = int(time.time()) + idx
@@ -672,16 +686,23 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         if valid_paths:
             loaded_clips = []
             clip_by_scene = {}  # 씬 번호 → 그 씬 나레이션에 맞춰 고른 클립 (파일명 끝 _{씬번호}.mp4)
+            import re as _re
+            _re_scene = _re.compile(r"_(\d+)\.(?:mp4|png)$")
+            talk_scenes = set()  # 템플릿의 '말하는 장면'(졸라맨만) — 묶음 안에 카드·차트가 있으면 그쪽을 먼저 보여 준다
             for p in valid_paths:
                 try:
-                    clip = VideoFileClip(p)
+                    # 템플릿 장면은 PNG 한 장 — 길이는 아래에서 그룹 길이로 잘린다
+                    clip = ImageClip(p).set_duration(600) if p.endswith(".png") else VideoFileClip(p)
                 except Exception as e:
                     logger.warning(f"비디오 로딩 에러: {e}")
                     continue
                 loaded_clips.append(clip)
-                m = re.search(r"_(\d+)\.mp4$", p)
+                # 이 함수 뒤쪽에 `import re`가 있어 여기서 전역 re를 쓰면 UnboundLocalError가 난다(PR #7에서 생긴 버그).
+                m = _re_scene.search(p)
                 if m:
                     clip_by_scene[int(m.group(1))] = clip
+                    if "_talk_" in os.path.basename(p):
+                        talk_scenes.add(int(m.group(1)))
                     
             if loaded_clips:
                 current_time = 0.0
@@ -722,8 +743,9 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
                     
                     # 그룹 안 씬 중 자기 클립이 있는 첫 씬의 클립을 쓴다. 예전엔 그룹 순번으로 클립을 돌려 써서
                     # "GPU" 씬용으로 고른 영상이 다른 문장 위에 깔렸다. 맞는 클립이 없을 때만 순번 방식으로 채운다.
+                    ordered = [i for i in scene_indices if i not in talk_scenes] + [i for i in scene_indices if i in talk_scenes]
                     source_clip = next(
-                        (clip_by_scene[i] for i in scene_indices if i in clip_by_scene),
+                        (clip_by_scene[i] for i in ordered if i in clip_by_scene),
                         loaded_clips[group_source_idx],
                     )
                     
@@ -837,7 +859,9 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         title_intro_duration = min(4.5, target_duration)
         title_clip = ImageClip(title_np).set_duration(title_intro_duration).fadeout(0.4)
         title_clip = title_clip.set_position(('center', 80)) # Y=80 최상단 밀착
-        overlays.append(title_clip)
+        template_mode = shorts_template.is_active()  # 템플릿은 머리띠·배경을 직접 그리므로 제목·틴트·박스를 얹지 않는다
+        if not template_mode:
+            overlays.append(title_clip)
 
         bg_video_clip = canvas
         
@@ -864,12 +888,14 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
         # [Tone & Manner 동기화] 영상 전체 톤을 하나로 묶어주는 시네마틱 컬러 필터 (Dark Navy 15% 코팅)
         cinematic_tint = ColorClip(size=(1080, 1920), color=(15, 23, 42)).set_opacity(0.15).set_duration(target_duration)
         cinematic_tint = cinematic_tint.set_position(('center', 'center'))
-        overlays.append(cinematic_tint)
+        if not template_mode:
+            overlays.append(cinematic_tint)
 
         # [Gemini 3.1 Pro 피드백 적용 3] 자막 가독성 확보용 다크 박스
         dim_box = ColorClip(size=(1080, 600), color=(0,0,0)).set_opacity(0.45).set_duration(target_duration)
         dim_box = dim_box.set_position(('center', 1000))
-        overlays.append(dim_box)
+        if not template_mode:
+            overlays.append(dim_box)
                 
         def _load_subtitle_font(size):
             # 윈도우(맑은 고딕) → 리눅스 Railway(나눔고딕, Dockerfile에서 설치) 순. 둘 다 없으면 기본 비트맵 글꼴이라
@@ -956,7 +982,7 @@ async def step_4_assemble_video(video_paths: list, audio_path: str, narrations: 
                 text_np_array = create_text_image(chunk, width=1080, height=300)
                 txt_clip = ImageClip(text_np_array).set_duration(end_time - start_time)
                 # 하위 3분할(자막 영역)의 Safe Zone: 1150 (모바일 UI에 가리지 않는 유튜브 쇼츠 안전구역)
-                txt_clip = txt_clip.set_position(('center', 1150)).set_start(start_time)
+                txt_clip = txt_clip.set_position(('center', 1450 if template_mode else 1150)).set_start(start_time)
                 
                 subtitles.append(txt_clip)
                 scene_current_time = end_time
@@ -1611,6 +1637,19 @@ async def refresh_published_metrics():
         logger.error(f"메트릭 추이 갱신 실패: {e}")
 
 
+def _upload_description(disclaimer: str) -> str:
+    """설명란: 텐배거 링크 + (템플릿 사진을 썼다면) 사진 출처 + 면책 문구."""
+    parts = []
+    site = os.getenv("TENBAGGER_PUBLIC_URL") or os.getenv("TENBAGGER_API_BASE", "")
+    if site and shorts_template.CTX.get("ticker"):
+        parts.append(f"텐배거에서 {shorts_template.CTX.get('name', '')} 분석 보기: {site.rstrip('/')}/index.html?ticker={shorts_template.CTX['ticker']}")
+    credit = shorts_template.photo_credit_line()
+    if credit:
+        parts.append(credit)
+    parts.append(disclaimer)
+    return "\n\n".join(p for p in parts if p)
+
+
 async def run_one_cycle() -> str:
     """영상 생성 -> YouTube 업로드 -> 검토 기록 -> 메트릭 -> 프롬프트 진화, 1회 시도.
 
@@ -1621,6 +1660,7 @@ async def run_one_cycle() -> str:
             / "qc_blocked" 업로드 전 자동 점검(qc.py)에 걸려 올리지 않음
     """
     qc.reset()
+    shorts_template.reset()
     try:
         job_id = f"auto_loop_{int(time.time())}"
         jobs[job_id] = {"status": "무한 루프: 영상 생성을 시작합니다", "topic": "auto"}
@@ -1643,6 +1683,7 @@ async def run_one_cycle() -> str:
             video_abs_path = os.path.join(BASE_DIR, video_rel_url.lstrip("/"))
 
             # 업로드 전 자동 점검 — 하나라도 걸리면 올리지 않는다(오너 결정 2026-11-23).
+            qc.RUN["template"] = shorts_template.is_active()
             qc.RUN["alignment"] = await asyncio.to_thread(
                 qc.score_alignment, video_abs_path, qc.RUN.get("samples", [])
             )
@@ -1659,7 +1700,7 @@ async def run_one_cycle() -> str:
                     youtube_uploader.upload_video,
                     video_abs_path,
                     jobs[job_id].get("top_title", "텐배거 헌터 숏츠"),
-                    jobs[job_id].get("disclaimer_text", ""),
+                    _upload_description(jobs[job_id].get("disclaimer_text", "")),
                 )
                 logger.info(f"YouTube 업로드 완료: video_id={video_id}")
 

@@ -114,6 +114,9 @@ async def pick_tenbagger_topic(exclude_topics: list[str] | None = None,
         # 텐배거 분석 카드 클립 생성 (영상 source_type=='card' 씬에 삽입)
         asset_clips = {}
         if render_clips:
+            # 고정 템플릿 재료(뉴스 헤드라인·자유 이용 사진·텐배거 화면 캡처) 준비 — 실패한 재료는 talk 장면으로 대신
+            import shorts_template
+            await shorts_template.prepare(c, "전망 · 텐배거 후보", clip_dir)
             os.makedirs(clip_dir, exist_ok=True)
             card_path = os.path.join(clip_dir, f"card_{c['ticker']}.mp4")
             card_data = {

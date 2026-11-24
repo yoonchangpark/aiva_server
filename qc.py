@@ -134,7 +134,9 @@ def blocking_reasons() -> list[str]:
     if RUN.get("font_fallback"):
         reasons.append("자막 글꼴: 한글 글꼴을 못 찾아 기본 글꼴로 렌더됨")
     scores = RUN.get("alignment", [])
-    if scores:
+    # 템플릿 모드는 배경이 스톡 영상이 아니라 직접 그린 카드·졸라맨이라 "배경-나레이션 불일치" 기준이 맞지 않는다.
+    # 점수는 기록만 하고 차단하지 않는다.
+    if scores and not RUN.get("template"):
         bad = [s for s in scores if int(s.get("score", 10)) < MATCH_MIN_SCORE]
         if len(bad) / len(scores) > MISMATCH_BLOCK_RATIO:
             reasons.append(f"영상-내용 불일치: {len(scores)}장면 중 {len(bad)}장면이 {MATCH_MIN_SCORE}점 미만")

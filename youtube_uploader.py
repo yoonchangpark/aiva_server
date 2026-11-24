@@ -32,6 +32,7 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 # tenbagger_topic.py의 DISCLAIMER와 같은 문구 — 설명란에도 동일하게 남긴다.
 DEFAULT_DISCLAIMER = "이 영상은 재무 데이터 기반 분석이며 투자 권유가 아닙니다. 투자 판단의 책임은 본인에게 있습니다."
+TENBAGGER_CTA = "더 많은 종목 분석 · 텐배거 헌터: https://tenbagger-production.up.railway.app"
 
 
 def _materialize_credentials_from_env() -> None:
@@ -118,6 +119,8 @@ def upload_video(
         )
 
     full_description = description.strip()
+    if TENBAGGER_CTA not in full_description:
+        full_description = (full_description + "\n\n" + TENBAGGER_CTA).strip()
     if DEFAULT_DISCLAIMER not in full_description:
         full_description = (full_description + "\n\n" + DEFAULT_DISCLAIMER).strip()
 
